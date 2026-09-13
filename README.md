@@ -4,7 +4,7 @@ Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi,
 
 Agents can use Memex through its MCP server or CLI skill. Ask about a previous session, then narrow the search and retrieve source records as needed.
 
-Includes a TUI for browsing, finding and resuming agent CLI sessions, with optional [token usage](#token-usage) tracking.
+Includes a TUI for browsing, finding and resuming agent CLI sessions, with optional [token usage](#token-usage) tracking. Along with a [herdr plugin](#herdr-plugin)
 
 ![memex tui](docs/tui.png?raw=1&v=4)
 
