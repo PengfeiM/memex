@@ -12,6 +12,10 @@ A native macOS companion is available. More details at [apps/macos](apps/macos/R
 
 <img width="1388" height="934" alt="Screenshot 2026-09-13 at 1 50 30 PM" src="https://github.com/user-attachments/assets/5d38680e-a8d5-4e43-8d9f-e7de5d3f2a14" />
 
+A Qt companion is available as well.
+
+<img width="1178" height="768" alt="download (8)" src="https://github.com/user-attachments/assets/1de09c11-e432-4613-9928-a32b39be204a" />
+
 ## Install
 ```bash
 brew install nicosuave/tap/memex
