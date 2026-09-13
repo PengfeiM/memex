@@ -8,9 +8,9 @@ Includes a TUI for browsing, finding and resuming agent CLI sessions, with optio
 
 ![memex tui](docs/tui.png?raw=1&v=4)
 
-A native macOS companion is available in [apps/macos](apps/macos/README.md), with
-a three-column browser and collapsed tool activity. Build and launch it with
-`apps/macos/scripts/launch.sh`; no Xcode GUI is required.
+A native macOS companion is available. More details at [apps/macos](apps/macos/README.md).
+
+<img width="1388" height="934" alt="Screenshot 2026-09-13 at 1 50 30 PM" src="https://github.com/user-attachments/assets/5d38680e-a8d5-4e43-8d9f-e7de5d3f2a14" />
 
 ## Install
 ```bash
@@ -33,6 +33,12 @@ Or (with [Nix](https://nixos.org/)):
 
 ```bash
 nix run github:nicosuave/memex
+```
+
+### Native Mac App
+
+```
+brew install nicosuave/tap/memex-app
 ```
 
 <details>
