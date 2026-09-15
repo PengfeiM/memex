@@ -10,7 +10,7 @@ Includes a TUI for browsing, finding and resuming agent CLI sessions, with optio
 
 A native macOS companion is available. More details at [apps/macos](apps/macos/README.md).
 
-<img width="1334" height="858" alt="Screenshot 2026-09-15 at 8 00 28 AM" src="https://github.com/user-attachments/assets/c0818e39-2a33-410b-b3c2-0c3db05feb57" />
+<img width="1876" height="1146" alt="image" src="https://github.com/user-attachments/assets/6e112c96-5b1c-4de3-80bc-c06939dac18a" />
 
 A Qt companion is available as well.
 
