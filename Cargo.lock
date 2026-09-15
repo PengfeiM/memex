@@ -1726,7 +1726,7 @@ dependencies = [
  "gix-validate",
  "gix-worktree-stream",
  "nonempty",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -1753,7 +1753,7 @@ dependencies = [
  "gix-quote",
  "gix-trace",
  "kstring",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
  "unicode-bom",
 ]
@@ -1807,7 +1807,7 @@ dependencies = [
  "gix-path",
  "gix-ref",
  "gix-sec",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
  "unicode-bom",
 ]
@@ -1909,7 +1909,7 @@ dependencies = [
  "gix-quote",
  "gix-trace",
  "gix-utils",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -1989,7 +1989,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "itoa",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -2029,7 +2029,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "memmap2",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -2119,7 +2119,7 @@ dependencies = [
  "gix-hash",
  "gix-revision",
  "gix-validate",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -2151,7 +2151,7 @@ dependencies = [
  "gix-hash",
  "gix-hashtable",
  "gix-object",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -2227,7 +2227,7 @@ dependencies = [
  "gix-hashtable",
  "gix-object",
  "gix-revwalk",
- "smallvec 1.15.1",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
@@ -2439,7 +2439,7 @@ dependencies = [
  "rand 0.9.2",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.20",
  "ureq 2.12.1",
  "windows-sys 0.60.2",
 ]
