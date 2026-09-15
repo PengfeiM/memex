@@ -134,18 +134,18 @@ brew install --cask nicosuave/tap/memex-app
 brew upgrade --cask nicosuave/tap/memex-app
 ```
 
-Alternatively, download `memex-app-VERSION-macos-universal.zip` from the matching
+Alternatively, download `memex-app-VERSION-macos-arm64.zip` from the matching
 GitHub release, unzip it, and move `Memex.app` to Applications. The app includes
-its CLI and supports Apple Silicon and Intel on macOS 14+. The separate `memex`
+its CLI and supports Apple Silicon on macOS 14+. The separate `memex`
 formula remains available for terminal use. There is no in-app updater.
 
-The release Mac needs Xcode developer tools, Rust with both macOS targets, `gh`,
+The release Mac needs Xcode developer tools, Rust with the Apple Silicon macOS target, `gh`,
 and `jq`, plus a Developer ID Application certificate with its private key in
 Keychain. Authenticate `gh` with write access to `nicosuave/memex` and
 `nicosuave/homebrew-tap`. Set up Rust targets once:
 
 ```sh
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+rustup target add aarch64-apple-darwin
 ```
 
 Use the existing `sidequery-notarization` notarytool Keychain profile, or create a
@@ -166,7 +166,7 @@ scripts/release_macos_local.sh VERSION
 
 The command checks the package version, clean checkout, local/published tag, and
 GitHub release. It builds both the Swift app and Rust helper from that checkout,
-verifies both architectures and system-library dependencies, signs with hardened
+verifies the arm64 architecture and system-library dependencies, signs with hardened
 runtime, submits to Apple, requires an Accepted result, staples the ticket, and
 checks Gatekeeper. It then verifies the extracted ZIP, uploads it and its SHA256,
 and creates or updates `Casks/memex-app.rb` in the tap using your local GitHub
@@ -187,7 +187,7 @@ downloads the published app and verifies its checksum before updating the tap:
 apps/macos/scripts/publish-cask.sh VERSION
 ```
 
-To validate universal packaging without Apple credentials or publishing anything:
+To validate Apple Silicon packaging without Apple credentials or publishing anything:
 
 ```sh
 apps/macos/scripts/build-release.sh
@@ -240,7 +240,7 @@ The packaging script checks that both executables depend only on Apple's system
 libraries. Custom CLI builds with external libraries fail with the dependency name
 rather than producing a bundle that depends on your Homebrew installation.
 The normal build targets the local machine and signs ad hoc for development;
-the app release commands above build universal bundles for distribution.
+the app release commands above build arm64 bundles for distribution.
 
 The SwiftUI shell embeds an AppKit NSTableView transcript with native text selection.
 The transcript has no LazyVStack; row measurements retain TextKit glyph layout across resizes. Tool bodies are only
