@@ -1,5 +1,5 @@
 use super::{IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions, SourceFile};
-use crate::state::OpencodeDatabaseState;
+use crate::state::{OpencodeDatabaseState, OpencodeSessionCursor};
 use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::{Context, Result, bail};
@@ -233,6 +233,26 @@ pub struct OpencodeSession {
     pub time_updated: u64,
 }
 
+/// Detect the OpenCode v2 schema by table presence alone.
+///
+/// Column inspection is deliberately omitted: planning only needs to know whether the v2
+/// session/message projection exists, and hydration performs its own validation later.
+fn has_v2_schema(connection: &Connection, path: &Path) -> Result<bool> {
+    for table in ["session_v2", "session_message"] {
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .with_context(|| format!("inspect OpenCode v2 schema in {}", path.display()))?;
+        if exists == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Enumerate the modern session inventory from one OpenCode database.
 pub fn enumerate_sessions(path: &Path) -> Result<Vec<OpencodeSession>> {
     let connection = open_read_only_database(path)?;
@@ -240,15 +260,13 @@ pub fn enumerate_sessions(path: &Path) -> Result<Vec<OpencodeSession>> {
     enumerate_sessions_from_connection(&connection, path)
 }
 
-fn enumerate_sessions_from_connection(
+fn query_sessions(
     connection: &Connection,
     path: &Path,
+    query: &str,
 ) -> Result<Vec<OpencodeSession>> {
     let mut statement = connection
-        .prepare(
-            "SELECT id, parent_id, directory, time_created, time_updated
-             FROM session ORDER BY id",
-        )
+        .prepare(query)
         .with_context(|| format!("prepare OpenCode session query for {}", path.display()))?;
     let rows = statement
         .query_map([], |row| {
@@ -280,6 +298,32 @@ fn enumerate_sessions_from_connection(
     Ok(sessions)
 }
 
+fn enumerate_sessions_from_connection(
+    connection: &Connection,
+    path: &Path,
+) -> Result<Vec<OpencodeSession>> {
+    query_sessions(
+        connection,
+        path,
+        "SELECT id, parent_id, directory, time_created, time_updated
+         FROM session ORDER BY id",
+    )
+}
+
+/// Enumerate the v2 session inventory, which is authoritative wherever it overlaps the v1
+/// `session` table.
+fn enumerate_v2_sessions_from_connection(
+    connection: &Connection,
+    path: &Path,
+) -> Result<Vec<OpencodeSession>> {
+    query_sessions(
+        connection,
+        path,
+        "SELECT id, parent_id, directory, time_created, time_updated
+         FROM session_v2 ORDER BY id",
+    )
+}
+
 fn nonnegative_timestamp(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| anyhow::anyhow!("negative timestamp"))
 }
@@ -296,6 +340,8 @@ pub struct DatabaseScan {
     pub dirty_session_ids: Vec<String>,
     pub removed_session_ids: Vec<String>,
     pub cursor: DatabaseCursor,
+    pub session_cursors: HashMap<String, OpencodeSessionCursor>,
+    pub v2_session_ids: HashSet<String>,
 }
 
 fn require_event_schema(connection: &Connection, path: &Path) -> Result<()> {
@@ -361,6 +407,58 @@ fn current_event_cursor(connection: &Connection, path: &Path) -> Result<Database
         })
 }
 
+/// Read the per-session high-water marks from the v2 `session_message` projection.
+///
+/// `seq` is sparse and can be reused after a tail deletion, so both the maximum sequence and
+/// the maximum `time_updated` are remembered; comparing only one would miss row replacement.
+fn current_session_cursors(
+    connection: &Connection,
+    path: &Path,
+) -> Result<HashMap<String, OpencodeSessionCursor>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT session_id, MAX(seq), MAX(time_updated)
+             FROM session_message GROUP BY session_id",
+        )
+        .with_context(|| {
+            format!(
+                "prepare OpenCode v2 session cursor query for {}",
+                path.display()
+            )
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .with_context(|| format!("query OpenCode v2 session cursors in {}", path.display()))?;
+    let mut cursors = HashMap::new();
+    for row in rows {
+        let (session_id, max_seq, max_time_updated) = row?;
+        cursors.insert(
+            session_id.clone(),
+            OpencodeSessionCursor {
+                max_seq: nonnegative_cursor(max_seq)
+                    .with_context(|| format!("session `{session_id}` has invalid max seq"))?,
+                max_time_updated: nonnegative_cursor(max_time_updated).with_context(|| {
+                    format!("session `{session_id}` has invalid max time_updated")
+                })?,
+            },
+        );
+    }
+    Ok(cursors)
+}
+
+fn nonnegative_cursor(value: i64) -> Result<i64> {
+    if value < 0 {
+        bail!("negative cursor value");
+    }
+    Ok(value)
+}
+
 fn full_reconcile(
     sessions: &[OpencodeSession],
     previous: Option<&OpencodeDatabaseState>,
@@ -400,67 +498,119 @@ pub fn scan_database(
     // per-database fallback consistently.
     require_modern_schema(&connection, path)?;
     require_event_schema(&connection, path)?;
-    let sessions = enumerate_sessions_from_connection(&connection, path)?;
+    let v2 = has_v2_schema(&connection, path)?;
+    let (sessions, session_cursors, v2_session_ids) = if v2 {
+        // Union the v2 inventory with the v1 table, preferring the v2 row whenever a session id
+        // appears in both.  v2-only sessions must not be dropped, and shared sessions must carry
+        // the authoritative v2 metadata.
+        let mut by_id = enumerate_sessions_from_connection(&connection, path)?
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect::<HashMap<_, _>>();
+        let mut v2_ids = HashSet::new();
+        for session in enumerate_v2_sessions_from_connection(&connection, path)? {
+            v2_ids.insert(session.id.clone());
+            by_id.insert(session.id.clone(), session);
+        }
+        let mut sessions = by_id.into_values().collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        (
+            sessions,
+            current_session_cursors(&connection, path)?,
+            v2_ids,
+        )
+    } else {
+        (
+            enumerate_sessions_from_connection(&connection, path)?,
+            HashMap::new(),
+            HashSet::new(),
+        )
+    };
     let cursor = current_event_cursor(&connection, path)?;
     let (mut dirty, removed) = full_reconcile(&sessions, previous);
-    let current_ids = sessions
-        .iter()
-        .map(|session| session.id.as_str())
-        .collect::<HashSet<_>>();
 
-    let valid_previous = match previous {
-        Some(previous)
-            if previous.parser_version == DATABASE_STATE_VERSION
-                && previous.event_rowid >= 0
-                && cursor.event_rowid >= previous.event_rowid =>
+    if v2 {
+        // v2 databases are event-sourced, so the `event` rowid cursor cannot detect in-place
+        // `session_message` updates.  Per-session cursors drive change detection instead, and
+        // the event delta path is bypassed entirely.
+        if let Some(previous) =
+            previous.filter(|state| state.parser_version == DATABASE_STATE_VERSION)
         {
-            if previous.event_rowid == 0 && previous.event_id.is_none() {
-                true
-            } else if previous.event_rowid > 0 {
-                connection
-                    .query_row(
-                        "SELECT id FROM event WHERE rowid = ?1",
-                        [previous.event_rowid],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .with_context(|| format!("verify OpenCode event cursor in {}", path.display()))?
-                    .is_some_and(|event_id| Some(event_id) == previous.event_id)
-            } else {
-                false
+            let mut dirty_ids = HashSet::new();
+            for session in &sessions {
+                let is_new = !previous.owned_session_ids.contains(&session.id);
+                let is_changed = session_cursors.get(&session.id).is_some_and(|current| {
+                    previous.session_cursors.get(&session.id) != Some(current)
+                });
+                if is_new || is_changed {
+                    dirty_ids.insert(session.id.clone());
+                }
             }
+            dirty = dirty_ids.into_iter().collect();
+            dirty.sort();
         }
-        _ => false,
-    };
-
-    if valid_previous {
-        let mut statement = connection
-            .prepare(
-                "SELECT aggregate_id FROM event
-                 WHERE rowid > ?1 ORDER BY rowid",
-            )
-            .with_context(|| {
-                format!("prepare OpenCode event delta query for {}", path.display())
-            })?;
-        let rows = statement
-            .query_map(
-                [previous.expect("valid previous exists").event_rowid],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .with_context(|| format!("query OpenCode event delta in {}", path.display()))?;
-        let previous = previous.expect("valid previous exists");
-        let mut dirty_ids = current_ids
+    } else {
+        let current_ids = sessions
             .iter()
-            .filter(|id| !previous.owned_session_ids.contains(**id))
-            .map(|id| (*id).to_string())
+            .map(|session| session.id.as_str())
             .collect::<HashSet<_>>();
-        for row in rows {
-            if let Some(session_id) = row?.filter(|id| current_ids.contains(id.as_str())) {
-                dirty_ids.insert(session_id);
+
+        let valid_previous = match previous {
+            Some(previous)
+                if previous.parser_version == DATABASE_STATE_VERSION
+                    && previous.event_rowid >= 0
+                    && cursor.event_rowid >= previous.event_rowid =>
+            {
+                if previous.event_rowid == 0 && previous.event_id.is_none() {
+                    true
+                } else if previous.event_rowid > 0 {
+                    connection
+                        .query_row(
+                            "SELECT id FROM event WHERE rowid = ?1",
+                            [previous.event_rowid],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .with_context(|| {
+                            format!("verify OpenCode event cursor in {}", path.display())
+                        })?
+                        .is_some_and(|event_id| Some(event_id) == previous.event_id)
+                } else {
+                    false
+                }
             }
+            _ => false,
+        };
+
+        if valid_previous {
+            let mut statement = connection
+                .prepare(
+                    "SELECT aggregate_id FROM event
+                     WHERE rowid > ?1 ORDER BY rowid",
+                )
+                .with_context(|| {
+                    format!("prepare OpenCode event delta query for {}", path.display())
+                })?;
+            let rows = statement
+                .query_map(
+                    [previous.expect("valid previous exists").event_rowid],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .with_context(|| format!("query OpenCode event delta in {}", path.display()))?;
+            let previous = previous.expect("valid previous exists");
+            let mut dirty_ids = current_ids
+                .iter()
+                .filter(|id| !previous.owned_session_ids.contains(**id))
+                .map(|id| (*id).to_string())
+                .collect::<HashSet<_>>();
+            for row in rows {
+                if let Some(session_id) = row?.filter(|id| current_ids.contains(id.as_str())) {
+                    dirty_ids.insert(session_id);
+                }
+            }
+            dirty = dirty_ids.into_iter().collect();
+            dirty.sort();
         }
-        dirty = dirty_ids.into_iter().collect();
-        dirty.sort();
     }
 
     let scan = DatabaseScan {
@@ -468,6 +618,8 @@ pub fn scan_database(
         dirty_session_ids: dirty,
         removed_session_ids: removed,
         cursor,
+        session_cursors,
+        v2_session_ids,
     };
     connection
         .execute_batch("COMMIT")
@@ -1207,6 +1359,77 @@ mod tests {
         connection
     }
 
+    /// `modern_fixture` plus the OpenCode v2 `session_v2`/`session_message` projection.
+    fn v2_fixture(path: &Path) -> Connection {
+        let connection = modern_fixture(path);
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2 (
+                    id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+                 );
+                 CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX session_message_session_seq_idx
+                    ON session_message(session_id, seq);",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn insert_v2_session(
+        connection: &Connection,
+        id: &str,
+        parent_id: Option<&str>,
+        directory: &str,
+        time_created: i64,
+        time_updated: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO session_v2 (id, parent_id, directory, time_created, time_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, parent_id, directory, time_created, time_updated],
+            )
+            .unwrap();
+    }
+
+    fn insert_v2_message(
+        connection: &Connection,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        seq: i64,
+        time_created: i64,
+        time_updated: i64,
+        data: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO session_message
+                    (id, session_id, type, seq, time_created, time_updated, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, session_id, kind, seq, time_created, time_updated, data],
+            )
+            .unwrap();
+    }
+
+    fn state_from_scan(scan: &DatabaseScan) -> OpencodeDatabaseState {
+        OpencodeDatabaseState {
+            parser_version: DATABASE_STATE_VERSION,
+            event_rowid: scan.cursor.event_rowid,
+            event_id: scan.cursor.event_id.clone(),
+            owned_session_ids: scan.sessions.iter().map(|s| s.id.clone()).collect(),
+            session_cursors: scan.session_cursors.clone(),
+        }
+    }
+
+    const V2_USER_DATA: &str = r#"{"text":"hello","time":{"created":100}}"#;
+    const V2_ASSISTANT_DATA: &str = r#"{"agent":"build","model":{"providerID":"anthropic","id":"claude"},"content":[{"type":"text","text":"hi"}],"tokens":{"input":1,"output":2},"cost":0.0,"time":{"created":200}}"#;
+
     #[test]
     fn reasoning_is_included_in_output_and_total() {
         let temp = tempfile::tempdir().unwrap();
@@ -1704,5 +1927,272 @@ mod tests {
         let records = parse_database_session(&path, "wal", 0, &AtomicU64::new(0)).unwrap();
         assert_eq!(records[0].text, "changed while open");
         drop(writer);
+    }
+
+    #[test]
+    fn v2_bumped_time_updated_marks_session_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_a1",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            V2_USER_DATA,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_a2",
+            "s_child",
+            "assistant",
+            2,
+            200,
+            200,
+            V2_ASSISTANT_DATA,
+        );
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        assert_eq!(
+            initial.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                max_seq: 2,
+                max_time_updated: 200,
+            }
+        );
+        let previous = state_from_scan(&initial);
+
+        // Same sequence, newer in-place update: only the time_updated cursor moves.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE session_message SET time_updated = 250 WHERE id = 'sm_a2'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+    }
+
+    #[test]
+    fn v2_deleted_newest_row_marks_session_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_b1",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            V2_USER_DATA,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_b2",
+            "s_child",
+            "assistant",
+            2,
+            200,
+            200,
+            V2_ASSISTANT_DATA,
+        );
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        let previous = state_from_scan(&initial);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("DELETE FROM session_message WHERE id = 'sm_b2'", [])
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+        assert_eq!(
+            scan.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                max_seq: 1,
+                max_time_updated: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn v1_only_session_without_v2_messages_stays_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        assert!(initial.session_cursors.is_empty());
+        assert_eq!(initial.dirty_session_ids, vec!["s_child", "s_root"]);
+        let previous = state_from_scan(&initial);
+
+        // No `session_message` rows means no current cursor, so a steady-state v1-only
+        // session must never be re-hydrated.
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert!(scan.dirty_session_ids.is_empty());
+        assert!(scan.removed_session_ids.is_empty());
+    }
+
+    #[test]
+    fn v2_session_gaining_first_message_becomes_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        assert!(initial.session_cursors.is_empty());
+        let previous = state_from_scan(&initial);
+
+        // A missing previous cursor counts as changed: sessions first seen before they had
+        // any v2 messages must be picked up once messages appear.
+        let connection = Connection::open(&path).unwrap();
+        insert_v2_message(
+            &connection,
+            "sm_d1",
+            "s_child",
+            "user",
+            1,
+            150,
+            150,
+            V2_USER_DATA,
+        );
+        drop(connection);
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+    }
+
+    #[test]
+    fn v2_inventory_union_prefers_v2_and_reports_removals() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(&connection, "s_v2only", None, "/repo/v2-only", 500, 501);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/v2-child",
+            300,
+            400,
+        );
+        drop(connection);
+
+        let scan = scan_database(&path, None).unwrap();
+        assert_eq!(
+            scan.sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s_child", "s_root", "s_v2only"]
+        );
+        assert_eq!(
+            scan.v2_session_ids,
+            HashSet::from(["s_child".to_string(), "s_v2only".to_string()])
+        );
+        let shared = scan
+            .sessions
+            .iter()
+            .find(|session| session.id == "s_child")
+            .unwrap();
+        assert_eq!(shared.directory, "/repo/v2-child");
+        assert_eq!((shared.time_created, shared.time_updated), (300, 400));
+
+        let previous = state_from_scan(&scan);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("DELETE FROM session_v2 WHERE id = 's_v2only'", [])
+            .unwrap();
+        drop(connection);
+
+        let after = scan_database(&path, Some(&previous)).unwrap();
+        assert!(after.dirty_session_ids.is_empty());
+        assert_eq!(after.removed_session_ids, vec!["s_v2only"]);
+        assert_eq!(after.v2_session_ids, HashSet::from(["s_child".to_string()]));
+    }
+
+    #[test]
+    fn v2_parser_version_mismatch_forces_full_reconcile() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_f1",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            V2_USER_DATA,
+        );
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        let mut previous = state_from_scan(&initial);
+        // Cursors match, so only the parser-version bump can explain a full reconcile.
+        previous.parser_version = DATABASE_STATE_VERSION - 1;
+        previous.owned_session_ids.insert("s_gone".to_string());
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child", "s_root"]);
+        assert_eq!(scan.removed_session_ids, vec!["s_gone"]);
+    }
+
+    #[test]
+    fn v2_dirty_session_ids_are_sorted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_g1",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            V2_USER_DATA,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_g2",
+            "s_root",
+            "assistant",
+            1,
+            100,
+            100,
+            V2_ASSISTANT_DATA,
+        );
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        let previous = state_from_scan(&initial);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE session_message SET time_updated = time_updated + 10",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child", "s_root"]);
     }
 }
