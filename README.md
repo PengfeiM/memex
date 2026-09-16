@@ -41,6 +41,14 @@ Or (with [Nix](https://nixos.org/)):
 nix run github:nicosuave/memex
 ```
 
+### Cargo (Build from source)
+
+```bash
+# On Ubuntu/Debian, install build dependencies first:
+sudo apt update && sudo apt install -y build-essential libssl-dev pkg-config
+cargo install --locked --git https://github.com/nicosuave/memex
+```
+
 ### Native Mac App
 
 ```
