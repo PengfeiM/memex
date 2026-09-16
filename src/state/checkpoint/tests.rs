@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::Paths;
 use crate::lease::LeaseAttempt;
-use crate::state::{FileIdentity, PendingToolCall};
+use crate::state::{FileIdentity, OpencodeSessionCursor, PendingToolCall};
 use std::time::Duration;
 
 fn fixture() -> (tempfile::TempDir, PathBuf, IngestLease) {
@@ -50,6 +50,13 @@ fn database() -> OpencodeDatabaseState {
         event_rowid: i64::MIN,
         event_id: Some("event".into()),
         owned_session_ids: HashSet::from(["session".into()]),
+        session_cursors: HashMap::from([(
+            "session".into(),
+            OpencodeSessionCursor {
+                max_seq: i64::MIN,
+                max_time_updated: i64::MAX,
+            },
+        )]),
     }
 }
 

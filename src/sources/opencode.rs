@@ -26,7 +26,7 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// Bumped for the parent-linkage-only reclassification: unparented sessions
 /// with non-primary agent values were stored as subagent and must reconcile
 /// once so their records and analytics rows reflect the new kinds.
-pub const DATABASE_STATE_VERSION: u32 = 2;
+pub const DATABASE_STATE_VERSION: u32 = 3;
 
 pub fn matches_path(path: &str) -> bool {
     (path.contains("opencode/storage/message") || path.contains("opencode\\storage\\message"))
@@ -1419,6 +1419,7 @@ mod tests {
             event_rowid: initial.cursor.event_rowid,
             event_id: initial.cursor.event_id.clone(),
             owned_session_ids: initial.sessions.iter().map(|s| s.id.clone()).collect(),
+            ..Default::default()
         };
         let noop = scan_database(&path, Some(&initial_state)).unwrap();
         assert!(noop.dirty_session_ids.is_empty());
@@ -1438,6 +1439,7 @@ mod tests {
             event_rowid: event_scan.cursor.event_rowid,
             event_id: event_scan.cursor.event_id.clone(),
             owned_session_ids: event_scan.sessions.iter().map(|s| s.id.clone()).collect(),
+            ..Default::default()
         };
 
         connection
@@ -1479,6 +1481,7 @@ mod tests {
                 .iter()
                 .map(|session| session.id.clone())
                 .collect(),
+            ..Default::default()
         };
         let connection = Connection::open(&path).unwrap();
         connection
@@ -1685,6 +1688,7 @@ mod tests {
             event_rowid: initial.cursor.event_rowid,
             event_id: initial.cursor.event_id.clone(),
             owned_session_ids: initial.sessions.iter().map(|s| s.id.clone()).collect(),
+            ..Default::default()
         };
         writer
             .execute_batch(

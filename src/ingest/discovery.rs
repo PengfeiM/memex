@@ -776,6 +776,7 @@ pub(super) fn discover_opencode(
                     event_rowid: database.scan.cursor.event_rowid,
                     event_id: database.scan.cursor.event_id.clone(),
                     owned_session_ids,
+                    ..Default::default()
                 },
             );
         }
