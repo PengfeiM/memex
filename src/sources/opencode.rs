@@ -237,20 +237,26 @@ pub struct OpencodeSession {
     pub time_updated: u64,
 }
 
+/// Whether a table exists in an OpenCode database.
+fn table_exists(connection: &Connection, path: &Path, table: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .with_context(|| format!("inspect OpenCode table `{table}` in {}", path.display()))
+}
+
 /// Detect the OpenCode v2 schema by table presence alone.
 ///
 /// Column inspection is deliberately omitted: planning only needs to know whether the v2
-/// session/message projection exists, and hydration performs its own validation later.
+/// session/message projection exists, and hydration performs its own validation later.  This
+/// intentionally checks no v1 table, so v2-only databases are recognized.
 fn has_v2_schema(connection: &Connection, path: &Path) -> Result<bool> {
     for table in ["session_v2", "session_message"] {
-        let exists = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                [table],
-                |row| row.get::<_, i64>(0),
-            )
-            .with_context(|| format!("inspect OpenCode v2 schema in {}", path.display()))?;
-        if exists == 0 {
+        if !table_exists(connection, path, table)? {
             return Ok(false);
         }
     }
@@ -264,10 +270,11 @@ fn has_v2_schema(connection: &Connection, path: &Path) -> Result<bool> {
 /// before and produce byte-identical output.
 pub fn enumerate_sessions(path: &Path) -> Result<Vec<OpencodeSession>> {
     let connection = open_read_only_database(path)?;
-    require_modern_schema(&connection, path)?;
     if has_v2_schema(&connection, path)? {
+        // v2-only databases have no v1 `session` table; the union tolerates its absence.
         Ok(unioned_sessions_from_connection(&connection, path)?.0)
     } else {
+        require_modern_schema(&connection, path)?;
         enumerate_sessions_from_connection(&connection, path)
     }
 }
@@ -343,10 +350,15 @@ fn unioned_sessions_from_connection(
     connection: &Connection,
     path: &Path,
 ) -> Result<(Vec<OpencodeSession>, HashSet<String>)> {
-    let mut by_id = enumerate_sessions_from_connection(connection, path)?
-        .into_iter()
-        .map(|session| (session.id.clone(), session))
-        .collect::<HashMap<_, _>>();
+    // v2-only databases omit the v1 `session` table entirely; treat it as an empty inventory.
+    let mut by_id = if table_exists(connection, path, "session")? {
+        enumerate_sessions_from_connection(connection, path)?
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     let mut v2_ids = HashSet::new();
     for session in enumerate_v2_sessions_from_connection(connection, path)? {
         v2_ids.insert(session.id.clone());
@@ -420,6 +432,13 @@ fn require_event_schema(connection: &Connection, path: &Path) -> Result<()> {
 }
 
 fn current_event_cursor(connection: &Connection, path: &Path) -> Result<DatabaseCursor> {
+    // v2-only databases have no `event` table and their planning ignores the event cursor.
+    if !table_exists(connection, path, "event")? {
+        return Ok(DatabaseCursor {
+            event_rowid: 0,
+            event_id: None,
+        });
+    }
     connection
         .query_row(
             "SELECT rowid, id FROM event ORDER BY rowid DESC LIMIT 1",
@@ -527,11 +546,14 @@ pub fn scan_database(
     connection
         .execute_batch("BEGIN")
         .with_context(|| format!("begin OpenCode planning snapshot in {}", path.display()))?;
-    // Planning must reject databases that hydration cannot read, so ingest can apply its
-    // per-database fallback consistently.
-    require_modern_schema(&connection, path)?;
-    require_event_schema(&connection, path)?;
     let v2 = has_v2_schema(&connection, path)?;
+    if !v2 {
+        // Planning must reject databases that hydration cannot read, so ingest can apply its
+        // per-database fallback consistently.  v2-only databases legitimately lack the v1 tables
+        // and the event log, so these requirements are v1-only.
+        require_modern_schema(&connection, path)?;
+        require_event_schema(&connection, path)?;
+    }
     let (sessions, session_cursors, v2_session_ids) = if v2 {
         // Union the v2 inventory with the v1 table, preferring the v2 row whenever a session id
         // appears in both.  v2-only sessions must not be dropped, and shared sessions must carry
@@ -907,7 +929,9 @@ pub(crate) fn parse_database_records(
 /// Open once for a batch of `parse_session_records` calls against the same database.
 pub(crate) fn open_database_for_sessions(path: &Path) -> Result<Connection> {
     let connection = open_read_only_database(path)?;
-    require_modern_schema(&connection, path)?;
+    if !has_v2_schema(&connection, path)? {
+        require_modern_schema(&connection, path)?;
+    }
     Ok(connection)
 }
 
@@ -1201,6 +1225,8 @@ fn v2_session_parent_id(
         })?;
     match v2_parent {
         Some(parent_id) => Ok(parent_id),
+        // v2-only databases omit the v1 `session` table; there is no fallback linkage to read.
+        None if !table_exists(connection, path, "session")? => Ok(None),
         None => Ok(
             enumerate_session_from_connection(connection, path, session_id)?
                 .and_then(|session| session.parent_id),
@@ -1496,14 +1522,21 @@ pub(crate) fn parse_session_records_v2(
     // ids are globally unique, so excluding the v2 ids is sufficient deduplication; v2 wins on
     // conflict.  The exclusion is intentionally id-based, not kind-based: when a v2 row is a
     // skipped kind (e.g. `synthetic`), its v1 counterpart is excluded too, so content-parity loss
-    // versus pre-v2 indexing is accepted policy (Phase C type policy stays uniform).
-    for message in collect_modern_messages(
-        connection,
-        path,
-        session_id,
-        Some(&v2_ids),
-        &mut diagnostics,
-    )? {
+    // versus pre-v2 indexing is accepted policy (Phase C type policy stays uniform).  v2-only
+    // databases have no v1 `message`/`part` tables, so the union is skipped entirely.
+    let v1_message_tables =
+        table_exists(connection, path, "message")? && table_exists(connection, path, "part")?;
+    for message in if v1_message_tables {
+        collect_modern_messages(
+            connection,
+            path,
+            session_id,
+            Some(&v2_ids),
+            &mut diagnostics,
+        )?
+    } else {
+        Vec::new()
+    } {
         let text = message.text_parts.join("\n");
         // v1-only rows carry no tool fields, so `emit_modern_message` would have dropped an empty
         // projection; mirror that here instead of emitting a blank record.
@@ -1655,12 +1688,15 @@ fn parse_usage_database(path: &Path) -> Result<Vec<UsageEvent>> {
 
         // Keep v1 rows that have no v2 counterpart so v1-only sessions (and dual-store rows the
         // v2 projection is missing) still contribute; ids already seen above are skipped.
-        let mut statement = connection.prepare(
-            "SELECT id, session_id, data FROM message
-             WHERE id NOT IN (SELECT id FROM session_message)",
-        )?;
-        let rows = statement.query_map([], usage_row)?;
-        collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
+        // v2-only databases have no v1 `message` table, so the union contributes nothing.
+        if table_exists(&connection, path, "message")? {
+            let mut statement = connection.prepare(
+                "SELECT id, session_id, data FROM message
+                 WHERE id NOT IN (SELECT id FROM session_message)",
+            )?;
+            let rows = statement.query_map([], usage_row)?;
+            collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
+        }
     } else {
         let mut statement = connection.prepare("SELECT id, session_id, data FROM message")?;
         let rows = statement.query_map([], usage_row)?;
@@ -1740,8 +1776,8 @@ fn usage_event(
             .map(timestamp_millis)
             .unwrap_or(0),
         project: Some(SourceKind::Opencode.label().to_string()),
-        provider: provider.clone(),
-        model: model.clone(),
+        provider,
+        model,
         tokens,
         source_cost_usd: value.get("cost").and_then(|value| value.as_f64()),
         cost_authoritative: false,
@@ -1767,8 +1803,10 @@ fn usage_provider_model(value: &BorrowedValue<'_>) -> (Option<String>, Option<St
             .filter(|provider| !provider.is_empty())
             .map(str::to_string)
             .or_else(|| borrowed_string(value, &["providerID", "provider"]));
+        // Legacy object-form rows key the model as `modelID` rather than `id`.
         let model = model_object
             .get("id")
+            .or_else(|| model_object.get("modelID"))
             .and_then(|model| model.as_str())
             .filter(|model| !model.is_empty())
             .map(str::to_string)
@@ -1880,6 +1918,31 @@ mod tests {
                  );
                  CREATE UNIQUE INDEX session_message_session_seq_idx
                     ON session_message(session_id, seq);",
+            )
+            .unwrap();
+        connection
+    }
+
+    /// A v2-only database: `session_v2`/`session_message` only, with no v1
+    /// `session`/`message`/`part`/`event` tables.
+    fn v2_only_fixture(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2 (
+                    id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+                 );
+                 CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                    seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX session_message_session_seq_idx
+                    ON session_message(session_id, seq);
+                 INSERT INTO session_v2 VALUES ('s_v2only', NULL, '/repo/v2-only', 10, 200);
+                 INSERT INTO session_message VALUES ('sm_user', 's_v2only', 'user', 1, 100, 100, '{\"text\":\"hello v2\"}');
+                 INSERT INTO session_message VALUES ('sm_assistant', 's_v2only', 'assistant', 2, 200, 200, '{\"model\":{\"providerID\":\"anthropic\",\"id\":\"claude\"},\"content\":[{\"type\":\"text\",\"text\":\"assistant v2\"}],\"tokens\":{\"input\":1,\"output\":2},\"cost\":0.0,\"time\":{\"created\":200}}');",
             )
             .unwrap();
         connection
@@ -3704,5 +3767,78 @@ mod tests {
         assert_eq!(events[0].model.as_deref(), Some("claude-3"));
         assert_eq!(events[0].tokens.uncached_input, 7);
         assert_eq!(events[0].timestamp_ms, 400_000);
+    }
+
+    #[test]
+    fn v2_only_database_plans_enumerates_and_hydrates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_only_fixture(&path);
+        drop(connection);
+
+        let scan = scan_database(&path, None).unwrap();
+        assert_eq!(
+            scan.sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s_v2only"]
+        );
+        assert_eq!(scan.v2_session_ids, HashSet::from(["s_v2only".to_string()]));
+        assert_eq!(scan.dirty_session_ids, vec!["s_v2only"]);
+        assert!(scan.removed_session_ids.is_empty());
+        assert_eq!(
+            scan.session_cursors["s_v2only"],
+            OpencodeSessionCursor {
+                max_seq: 2,
+                max_time_updated: 200,
+            }
+        );
+        assert_eq!(scan.cursor.event_rowid, 0);
+        assert_eq!(scan.cursor.event_id, None);
+
+        let sessions = enumerate_sessions(&path).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s_v2only"]
+        );
+        assert_eq!(sessions[0].directory, "/repo/v2-only");
+
+        // Hydration must also tolerate the absent v1 `message`/`part` tables.
+        let records = parse_database_session(&path, "s_v2only", 0, &AtomicU64::new(1)).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["hello v2", "assistant v2"]
+        );
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn v2_only_database_usage_reads_v2_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_only_fixture(&path);
+        drop(connection);
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(events[0].model.as_deref(), Some("claude"));
+        assert_eq!(events[0].session_id.as_deref(), Some("s_v2only"));
+        assert_eq!(events[0].tokens.uncached_input, 1);
+        assert_eq!(events[0].tokens.output, 2);
+    }
+
+    #[test]
+    fn usage_provider_model_reads_legacy_object_model_id() {
+        let mut data = br#"{"model":{"providerID":"p","modelID":"m"}}"#.to_vec();
+        let value = simd_json::to_borrowed_value(&mut data).unwrap();
+        assert_eq!(
+            usage_provider_model(&value),
+            (Some("p".to_string()), Some("m".to_string()))
+        );
     }
 }
