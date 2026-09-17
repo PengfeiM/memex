@@ -1642,17 +1642,45 @@ fn parse_usage_message(path: &Path) -> Result<Vec<UsageEvent>> {
 
 fn parse_usage_database(path: &Path) -> Result<Vec<UsageEvent>> {
     let connection = open_read_only_database(path)?;
-    let mut statement = connection.prepare("SELECT id, session_id, data FROM message")?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut ids = HashSet::new();
     let mut events = Vec::new();
+    if has_v2_schema(&connection, path)? {
+        // v2 assistant rows carry the usage projection.  v2 `data` has no top-level
+        // `sessionID`, so the selected `session_id` column is passed as the fallback.
+        let mut statement = connection
+            .prepare("SELECT id, session_id, data FROM session_message WHERE type = 'assistant'")?;
+        let rows = statement.query_map([], usage_row)?;
+        collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
+
+        // Keep v1 rows that have no v2 counterpart so v1-only sessions (and dual-store rows the
+        // v2 projection is missing) still contribute; ids already seen above are skipped.
+        let mut statement = connection.prepare(
+            "SELECT id, session_id, data FROM message
+             WHERE id NOT IN (SELECT id FROM session_message)",
+        )?;
+        let rows = statement.query_map([], usage_row)?;
+        collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
+    } else {
+        let mut statement = connection.prepare("SELECT id, session_id, data FROM message")?;
+        let rows = statement.query_map([], usage_row)?;
+        collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
+    }
+    Ok(events)
+}
+
+fn usage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Option<String>, String)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+}
+
+/// Project usage rows into events, deduping by id (v2 rows are read first and win).
+fn collect_usage_events(
+    path: &Path,
+    source_path: &Arc<str>,
+    ids: &mut HashSet<String>,
+    events: &mut Vec<UsageEvent>,
+    rows: impl Iterator<Item = rusqlite::Result<(String, Option<String>, String)>>,
+) -> Result<()> {
     for row in rows {
         let (id, session, data) = row?;
         if ids.contains(&id) {
@@ -1668,7 +1696,7 @@ fn parse_usage_database(path: &Path) -> Result<Vec<UsageEvent>> {
             events.push(event);
         }
     }
-    Ok(events)
+    Ok(())
 }
 
 fn usage_event(
@@ -1697,6 +1725,7 @@ fn usage_event(
     if tokens.additive_total() == 0 {
         return None;
     }
+    let (provider, model) = usage_provider_model(value);
     Some(UsageEvent {
         source: "opencode",
         source_path: Arc::from(path.to_string_lossy()),
@@ -1711,8 +1740,8 @@ fn usage_event(
             .map(timestamp_millis)
             .unwrap_or(0),
         project: Some(SourceKind::Opencode.label().to_string()),
-        provider: borrowed_string(value, &["providerID", "provider"]),
-        model: borrowed_string(value, &["modelID", "model"]),
+        provider: provider.clone(),
+        model: model.clone(),
         tokens,
         source_cost_usd: value.get("cost").and_then(|value| value.as_f64()),
         cost_authoritative: false,
@@ -1723,6 +1752,33 @@ fn usage_event(
         permission_review: false,
         source_order: 0,
     })
+}
+
+/// Provider/model for an OpenCode usage row.
+///
+/// v1 stores top-level `providerID`/`modelID` strings; v2 stores `model` as an object
+/// `{providerID, id, variant}` and has no top-level provider/model keys.  The object form is
+/// checked first so v2 rows never silently yield `None`.
+fn usage_provider_model(value: &BorrowedValue<'_>) -> (Option<String>, Option<String>) {
+    if let Some(model_object) = value.get("model").and_then(|model| model.as_object()) {
+        let provider = model_object
+            .get("providerID")
+            .and_then(|provider| provider.as_str())
+            .filter(|provider| !provider.is_empty())
+            .map(str::to_string)
+            .or_else(|| borrowed_string(value, &["providerID", "provider"]));
+        let model = model_object
+            .get("id")
+            .and_then(|model| model.as_str())
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .or_else(|| borrowed_string(value, &["modelID"]));
+        return (provider, model);
+    }
+    (
+        borrowed_string(value, &["providerID", "provider"]),
+        borrowed_string(value, &["modelID", "model"]),
+    )
 }
 
 fn borrowed_string(value: &BorrowedValue<'_>, aliases: &[&str]) -> Option<String> {
@@ -3509,5 +3565,144 @@ mod tests {
             .unwrap();
         assert_eq!(child.directory, "/repo/v2-child");
         assert_eq!((child.time_created, child.time_updated), (300, 400));
+    }
+
+    #[test]
+    fn v2_usage_assistant_event_uses_model_object_and_column_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_usage",
+            "s_child",
+            "assistant",
+            1,
+            200,
+            200,
+            V2_ASSISTANT_DATA,
+        );
+        drop(connection);
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.provider.as_deref(), Some("anthropic"));
+        assert_eq!(event.model.as_deref(), Some("claude"));
+        assert_eq!(event.session_id.as_deref(), Some("s_child"));
+        assert_eq!(event.source_record_id.as_deref(), Some("sm_usage"));
+        assert_eq!(event.message_id.as_deref(), Some("sm_usage"));
+        assert_eq!(event.tokens.uncached_input, 1);
+        assert_eq!(event.tokens.output, 2);
+        assert_eq!(event.timestamp_ms, 200_000);
+        assert_eq!(event.source_cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn v2_usage_token_buckets_include_cache_and_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        let data = serde_json::json!({
+            "model": {"providerID": "anthropic", "id": "claude"},
+            "tokens": {
+                "input": 10,
+                "output": 2,
+                "reasoning": 3,
+                "cache": {"read": 4, "write": 5}
+            },
+            "time": {"created": 100}
+        })
+        .to_string();
+        insert_v2_message(
+            &connection,
+            "sm_buckets",
+            "s_child",
+            "assistant",
+            1,
+            100,
+            100,
+            &data,
+        );
+        drop(connection);
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        let tokens = &events[0].tokens;
+        assert_eq!(tokens.uncached_input, 10);
+        assert_eq!(tokens.cache_read, 4);
+        assert_eq!(tokens.cache_write, 5);
+        assert_eq!(tokens.reasoning, 3);
+        assert_eq!(tokens.output, 5);
+    }
+
+    #[test]
+    fn v2_usage_unions_v1_only_messages_and_dedupes_shared_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_v2",
+            "s_child",
+            "assistant",
+            1,
+            100,
+            100,
+            V2_ASSISTANT_DATA,
+        );
+        // Same id in v1 with different tokens must not produce a second event.
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('sm_v2', 's_child', 100, ?1)",
+                [r#"{"tokens":{"input":999,"output":999}}"#],
+            )
+            .unwrap();
+        // A v1-only row must survive the union.
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('msg_v1only', 's_child', 300, ?1)",
+                [r#"{"tokens":{"input":5,"output":1},"providerID":"openai","modelID":"gpt","time":{"created":300}}"#],
+            )
+            .unwrap();
+        drop(connection);
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        let v2_event = events
+            .iter()
+            .find(|event| event.source_record_id.as_deref() == Some("sm_v2"))
+            .expect("v2 event");
+        assert_eq!(v2_event.tokens.uncached_input, 1);
+        assert_eq!(v2_event.provider.as_deref(), Some("anthropic"));
+        let v1_event = events
+            .iter()
+            .find(|event| event.source_record_id.as_deref() == Some("msg_v1only"))
+            .expect("v1-only event");
+        assert_eq!(v1_event.tokens.uncached_input, 5);
+        assert_eq!(v1_event.provider.as_deref(), Some("openai"));
+        assert_eq!(v1_event.model.as_deref(), Some("gpt"));
+        assert_eq!(v1_event.session_id.as_deref(), Some("s_child"));
+    }
+
+    #[test]
+    fn v1_usage_database_keeps_top_level_provider_and_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = modern_fixture(&path);
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('msg_v1', 's_child', 400, ?1)",
+                [r#"{"tokens":{"input":7,"output":3},"providerID":"anthropic","modelID":"claude-3","cost":0.5,"time":{"created":400}}"#],
+            )
+            .unwrap();
+        drop(connection);
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(events[0].model.as_deref(), Some("claude-3"));
+        assert_eq!(events[0].tokens.uncached_input, 7);
+        assert_eq!(events[0].timestamp_ms, 400_000);
     }
 }
