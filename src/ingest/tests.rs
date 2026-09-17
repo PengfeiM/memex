@@ -1444,6 +1444,88 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
 }
 
 #[test]
+fn opencode_v2_discovery_persists_session_cursors() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+            time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+         );
+         CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT, data TEXT
+         );
+         CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+         CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+         );
+         CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL
+         );
+         INSERT INTO session VALUES ('s_child', NULL, '/repo', 1, 2);
+         INSERT INTO message VALUES ('m_1', 's_child', 100, '{\"role\":\"assistant\"}');
+         INSERT INTO part VALUES ('p_1', 'm_1', '{\"type\":\"text\",\"text\":\"hi\"}');
+         INSERT INTO event VALUES ('e_1', 's_child');
+         INSERT INTO session_v2 VALUES ('s_child', NULL, '/repo', 1, 200);
+         INSERT INTO session_message VALUES ('sm_1', 's_child', 'user', 1, 100, 100, '{\"text\":\"hello\"}');
+         INSERT INTO session_message VALUES ('sm_2', 's_child', 'assistant', 2, 200, 200, '{\"text\":\"hi\"}');",
+    )
+    .unwrap();
+    drop(db);
+
+    let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(temp.path().as_os_str()))]);
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.include_opencode = true;
+    let state_path = paths.state.join("ingest.json");
+    let mut state = CheckpointSession::open(&state_path, &lease, true, None).unwrap();
+    let next_doc_id = Arc::new(AtomicU64::new(1));
+
+    let discovery = discovery::discover_opencode(
+        &paths,
+        &index,
+        &options,
+        None,
+        &mut state,
+        &None,
+        &next_doc_id,
+    )
+    .unwrap()
+    .expect("opencode discovery");
+
+    // The discovery write-through must copy the scan's per-session cursors verbatim so the next
+    // incremental run can detect in-place `session_message` changes.
+    let key = db_path.to_string_lossy().to_string();
+    let persisted = discovery
+        .database_states
+        .get(&key)
+        .expect("persisted database state");
+    assert_eq!(
+        persisted.parser_version,
+        crate::sources::opencode::DATABASE_STATE_VERSION
+    );
+    assert!(persisted.owned_session_ids.contains("s_child"));
+    assert_eq!(
+        persisted.session_cursors["s_child"],
+        crate::state::OpencodeSessionCursor {
+            max_seq: 2,
+            max_time_updated: 200,
+        }
+    );
+}
+
+#[test]
 fn stale_opencode_spools_are_cleaned_without_touching_other_state() {
     let temp = tempfile::tempdir().unwrap();
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();

@@ -26,6 +26,10 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// Bumped for the parent-linkage-only reclassification: unparented sessions
 /// with non-primary agent values were stored as subagent and must reconcile
 /// once so their records and analytics rows reflect the new kinds.
+///
+/// v3 also replaces the v1 event-rowid cursor with per-session
+/// `(max_seq, max_time_updated)` cursors for v2 databases, so persisted v1
+/// cursors must be re-derived once.
 pub const DATABASE_STATE_VERSION: u32 = 3;
 
 pub fn matches_path(path: &str) -> bool {
@@ -539,9 +543,8 @@ pub fn scan_database(
             let mut dirty_ids = HashSet::new();
             for session in &sessions {
                 let is_new = !previous.owned_session_ids.contains(&session.id);
-                let is_changed = session_cursors.get(&session.id).is_some_and(|current| {
-                    previous.session_cursors.get(&session.id) != Some(current)
-                });
+                let is_changed =
+                    previous.session_cursors.get(&session.id) != session_cursors.get(&session.id);
                 if is_new || is_changed {
                     dirty_ids.insert(session.id.clone());
                 }
@@ -2074,6 +2077,85 @@ mod tests {
 
         let scan = scan_database(&path, Some(&previous)).unwrap();
         assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+    }
+
+    #[test]
+    fn v2_steady_state_rescan_stays_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_h1",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            V2_USER_DATA,
+        );
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        assert_eq!(
+            initial.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                max_seq: 1,
+                max_time_updated: 100,
+            }
+        );
+        let previous = state_from_scan(&initial);
+
+        // A v2 session with an unchanged cursor must not be re-hydrated on every run.
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert!(scan.dirty_session_ids.is_empty());
+        assert!(scan.removed_session_ids.is_empty());
+    }
+
+    #[test]
+    fn v2_all_messages_removed_marks_session_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_message(
+            &connection,
+            "sm_i1",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            V2_USER_DATA,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_i2",
+            "s_child",
+            "assistant",
+            2,
+            200,
+            200,
+            V2_ASSISTANT_DATA,
+        );
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        let previous = state_from_scan(&initial);
+
+        // Deleting every `session_message` row leaves the `session_v2` row intact but drops the
+        // cursor entirely, so the previously indexed records must be pruned by re-hydrating.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM session_message WHERE session_id = 's_child'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+        assert!(!scan.session_cursors.contains_key("s_child"));
     }
 
     #[test]
