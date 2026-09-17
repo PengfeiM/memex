@@ -1494,7 +1494,9 @@ pub(crate) fn parse_session_records_v2(
 
     // Dual-store union: append v1 `message` rows with no `session_message` counterpart.  `msg_*`
     // ids are globally unique, so excluding the v2 ids is sufficient deduplication; v2 wins on
-    // conflict.
+    // conflict.  The exclusion is intentionally id-based, not kind-based: when a v2 row is a
+    // skipped kind (e.g. `synthetic`), its v1 counterpart is excluded too, so content-parity loss
+    // versus pre-v2 indexing is accepted policy (Phase C type policy stays uniform).
     for message in collect_modern_messages(
         connection,
         path,
@@ -1502,11 +1504,17 @@ pub(crate) fn parse_session_records_v2(
         Some(&v2_ids),
         &mut diagnostics,
     )? {
+        let text = message.text_parts.join("\n");
+        // v1-only rows carry no tool fields, so `emit_modern_message` would have dropped an empty
+        // projection; mirror that here instead of emitting a blank record.
+        if text.is_empty() {
+            continue;
+        }
         pending.push(V2PendingRecord {
             event_id: message.id,
             ts: message.timestamp,
             role: message.role,
-            text: message.text_parts.join("\n"),
+            text,
             tool_name: None,
             tool_input: None,
             tool_output: None,
@@ -1514,7 +1522,8 @@ pub(crate) fn parse_session_records_v2(
     }
 
     // The sort is stable, so equal-timestamp v2 rows keep their `seq` order and the turn_id
-    // sequence stays deterministic.
+    // sequence stays deterministic.  v1-only rows are appended after all v2 rows, so v2 wins
+    // equal-`ts` ties (arbitrary but stable).
     pending.sort_by_key(|record| record.ts);
     let mut turn_id = state.turn_id;
     for record in pending {
@@ -3192,9 +3201,11 @@ mod tests {
             r#"{"text":"from v2"}"#,
         );
         // A v1 row sharing the v2 id must be dropped in favor of the v2 projection, while a
-        // v1-only row must survive the union.
+        // v1-only row must survive the union.  A v1-only row with empty text must be dropped just
+        // as `emit_modern_message` would have dropped it.
         insert_v1_message(&connection, "sm_shared", "s_child", 100, "shadowed");
         insert_v1_message(&connection, "msg_v1only", "s_child", 50, "v1 only");
+        insert_v1_message(&connection, "msg_empty", "s_child", 25, "");
         drop(connection);
 
         let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
@@ -3209,7 +3220,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("msg_v1only"), Some("sm_shared")]
         );
+        assert_eq!(
+            records.iter().map(|r| r.turn_id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            records.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert!(!records.iter().any(|r| r.text == "shadowed"));
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.links.event_id.as_deref() == Some("msg_empty"))
+        );
     }
 
     #[test]
