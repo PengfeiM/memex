@@ -529,6 +529,35 @@ fn read_only_missing_state_creates_nothing_and_initialization_requires_permissio
 }
 
 #[test]
+fn interrupted_bootstrap_before_import_can_be_retried() {
+    for point in ["before_import", "before_import_commit"] {
+        let (_temp, path, lease) = fixture();
+        let error =
+            lifecycle::open_writer(&path, &lease, true, lifecycle::MigrationFailure::At(point))
+                .err()
+                .expect("injected bootstrap failure");
+        assert!(error.to_string().contains(point));
+        assert!(!has_authority(&path).expect("interrupted bootstrap remains readable"));
+        assert_eq!(
+            CheckpointReader::open(&path)
+                .unwrap()
+                .header()
+                .unwrap()
+                .next_doc_id,
+            1
+        );
+        assert!(CheckpointWriter::open(&path, &lease, false).is_err());
+        let writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+        assert!(has_authority(&path).unwrap());
+        for table in ["metadata", "files", "directories", "journal"] {
+            connection(&writer)
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
 fn empty_bootstrap_retry_requires_matching_receipt_and_initialization_permission() {
     let (_temp, path, lease) = fixture();
     assert!(
