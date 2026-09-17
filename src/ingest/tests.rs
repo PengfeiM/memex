@@ -1858,6 +1858,87 @@ fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
 }
 
 #[test]
+fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
+    use tantivy::Directory;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&db_path).expect("open OpenCode v2 fixture");
+    db.execute_batch(
+        "CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+            time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+         );
+         CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT, data TEXT
+         );
+         CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+         CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+         );
+         CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL
+         );
+         INSERT INTO session_v2 VALUES ('s_v2only', NULL, '/repo/v2', 1, 200);
+         INSERT INTO session_message VALUES ('sm_user', 's_v2only', 'user', 1, 100, 100, '{\"text\":\"v2 only queryable\"}');
+         INSERT INTO session_message VALUES ('sm_assistant', 's_v2only', 'assistant', 2, 200, 200, '{\"content\":[{\"type\":\"text\",\"text\":\"assistant reply\"},{\"type\":\"tool\",\"name\":\"bash\",\"state\":{\"input\":{\"cmd\":\"ls\"},\"metadata\":{\"output\":\"ok\"}}}]}');",
+    )
+    .expect("write OpenCode v2 fixture");
+    drop(db);
+    let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.include_opencode = true;
+
+    let first = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+    assert_eq!(first.expect("initial v2 ingest").records_added, 2);
+    let records = index
+        .records_by_session_id("s_v2only")
+        .expect("v2-only records");
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "v2 only queryable")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "assistant reply")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.tool_name.as_deref() == Some("bash"))
+    );
+
+    let metadata_before = index
+        .index
+        .directory()
+        .atomic_read(Path::new("meta.json"))
+        .unwrap();
+    let second = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+    assert_eq!(second.expect("no-op v2 rescan").records_added, 0);
+    assert_eq!(
+        metadata_before,
+        index
+            .index
+            .directory()
+            .atomic_read(Path::new("meta.json"))
+            .unwrap()
+    );
+}
+
+#[test]
 fn cursor_session_id_uses_agent_transcripts_session_directory() {
     let path = Path::new(
         "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
