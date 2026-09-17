@@ -876,6 +876,11 @@ pub(crate) fn parse_database_records(
     emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let connection = open_database_for_sessions(path)?;
+    // Phase D will drive this from `DatabaseScan::v2_session_ids`; until then the cheap
+    // membership probe keeps the internal readiness step self-contained.
+    if has_v2_schema(&connection, path)? && v2_session_exists(&connection, path, session_id)? {
+        return parse_session_records_v2(&connection, path, session_id, state, next_doc_id, emit);
+    }
     parse_session_records(&connection, path, session_id, state, next_doc_id, emit)
 }
 
@@ -1106,6 +1111,337 @@ fn emit_modern_message(
     })?;
     *turn_id = turn_id.saturating_add(1);
     Ok(())
+}
+
+/// One assistant message projected from the v2 `session_message` projection.
+#[derive(Default)]
+struct V2AssistantContent {
+    text_parts: Vec<String>,
+    tool_name: Option<String>,
+    tool_input: Option<String>,
+    tool_output: Option<String>,
+}
+
+impl V2AssistantContent {
+    fn has_tool_fields(&self) -> bool {
+        self.tool_name.is_some() || self.tool_input.is_some() || self.tool_output.is_some()
+    }
+}
+
+fn v2_session_exists(connection: &Connection, path: &Path, session_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM session_v2 WHERE id = ?1",
+            [session_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .with_context(|| {
+            format!(
+                "look up OpenCode v2 session `{session_id}` in {}",
+                path.display()
+            )
+        })
+}
+
+fn v2_session_parent_id(
+    connection: &Connection,
+    path: &Path,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let v2_parent = connection
+        .query_row(
+            "SELECT parent_id FROM session_v2 WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .with_context(|| {
+            format!(
+                "look up OpenCode v2 session parent for `{session_id}` in {}",
+                path.display()
+            )
+        })?;
+    match v2_parent {
+        Some(parent_id) => Ok(parent_id),
+        None => Ok(
+            enumerate_session_from_connection(connection, path, session_id)?
+                .and_then(|session| session.parent_id),
+        ),
+    }
+}
+
+/// Parent-linkage links mirroring the v1 `parse_session_records` rule.
+fn v2_session_links(parent_id: Option<String>) -> SessionLinks {
+    SessionLinks {
+        parent_session_id: parent_id.clone(),
+        thread_source: parent_id.as_ref().map(|_| "fork".to_string()),
+        conversation_kind: Some(if parent_id.is_some() {
+            "fork".to_string()
+        } else {
+            "main".to_string()
+        }),
+    }
+}
+
+fn v2_string_field(value: &BorrowedValue<'_>, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// First non-empty `state.content[].text` for a tool call, considering text items only.
+fn v2_tool_content_text(state: &BorrowedValue<'_>) -> Option<String> {
+    let items = state.get("content")?.as_array()?;
+    let mut parts = Vec::new();
+    for item in items {
+        if item.get("type").and_then(|kind| kind.as_str()) != Some("text") {
+            continue;
+        }
+        if let Some(text) = item
+            .get("text")
+            .and_then(|text| text.as_str())
+            .filter(|text| !text.is_empty())
+        {
+            parts.push(text.to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// Tool fields for one assistant content item, per the documented fallback chain.
+fn v2_tool_fields(item: &BorrowedValue<'_>) -> (Option<String>, Option<String>, Option<String>) {
+    let tool_name = item
+        .get("name")
+        .and_then(|name| name.as_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let Some(state) = item.get("state") else {
+        return (tool_name, None, None);
+    };
+    let tool_input = state
+        .get("input")
+        .and_then(|input| serde_json::to_string(input).ok());
+    let tool_output = v2_tool_content_text(state)
+        .or_else(|| {
+            state
+                .get("metadata")
+                .and_then(|metadata| v2_string_field(metadata, "output"))
+        })
+        .or_else(|| {
+            state
+                .get("metadata")
+                .and_then(|metadata| v2_string_field(metadata, "outputPath"))
+        })
+        .or_else(|| {
+            state
+                .get("metadata")
+                .and_then(|metadata| v2_string_field(metadata, "filepath"))
+        });
+    (tool_name, tool_input, tool_output)
+}
+
+fn v2_assistant_content(
+    value: &BorrowedValue<'_>,
+    diagnostics: &mut ParseDiagnostics,
+) -> V2AssistantContent {
+    let mut content = V2AssistantContent::default();
+    let Some(items) = value.get("content").and_then(|content| content.as_array()) else {
+        return content;
+    };
+    for item in items {
+        if item.as_object().is_none() {
+            diagnostics.malformed_json_lines += 1;
+            continue;
+        }
+        match item.get("type").and_then(|kind| kind.as_str()) {
+            Some("text") => {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .filter(|text| !text.is_empty())
+                {
+                    content.text_parts.push(text.to_string());
+                }
+            }
+            Some("tool") => {
+                let (name, input, output) = v2_tool_fields(item);
+                // One record per assistant message, so the last tool item wins.
+                content.tool_name = name;
+                content.tool_input = input;
+                content.tool_output = output;
+            }
+            Some("reasoning") | Some("file") => {}
+            Some(_) | None => {}
+        }
+    }
+    content
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_v2_record(
+    path: &Path,
+    session_id: &str,
+    links: &SessionLinks,
+    turn_id: &mut u32,
+    next_doc_id: &AtomicU64,
+    emit: &mut impl FnMut(Record) -> Result<()>,
+    event_id: String,
+    ts: u64,
+    role: String,
+    text: String,
+    tool_name: Option<String>,
+    tool_input: Option<String>,
+    tool_output: Option<String>,
+) -> Result<()> {
+    let mut record_links = links.record_links();
+    record_links.event_id = Some(event_id);
+    emit(Record {
+        source: SourceKind::Opencode,
+        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+        ts,
+        project: SourceKind::Opencode.label().to_string(),
+        session_id: session_id.to_string(),
+        turn_id: *turn_id,
+        role,
+        text,
+        tool_name,
+        tool_input,
+        tool_output,
+        links: record_links,
+        source_path: path.to_string_lossy().to_string(),
+    })?;
+    *turn_id = turn_id.saturating_add(1);
+    Ok(())
+}
+
+/// Project one OpenCode v2 `session_message` session into records.
+///
+/// v2 is event-sourced: every message kind shares one table, assistant content lives in a
+/// `content[]` array, and tool-only turns carry no text.  This deliberately does not reuse
+/// `emit_modern_message`, whose empty-text guard would drop those turns.
+pub(crate) fn parse_session_records_v2(
+    connection: &Connection,
+    path: &Path,
+    session_id: &str,
+    state: IndexParseState,
+    next_doc_id: &AtomicU64,
+    mut emit: impl FnMut(Record) -> Result<()>,
+) -> Result<IndexParseOutput> {
+    let parent_id = v2_session_parent_id(connection, path, session_id)?;
+    let links = v2_session_links(parent_id);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT id, type, seq, time_created, data
+             FROM session_message WHERE session_id = ?1 ORDER BY seq",
+        )
+        .with_context(|| format!("prepare OpenCode v2 message query for {}", path.display()))?;
+    let rows = statement
+        .query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .with_context(|| format!("query OpenCode v2 messages in {}", path.display()))?;
+
+    let mut turn_id = state.turn_id;
+    let mut diagnostics = ParseDiagnostics::default();
+    for row in rows {
+        let (message_id, kind, _seq, timestamp, data) = row?;
+        let timestamp = nonnegative_timestamp(timestamp)
+            .with_context(|| format!("message `{message_id}` has invalid time_created"))?;
+        match kind.as_str() {
+            "user" | "system" => {
+                let text = match parse_modern_value(data, |value| {
+                    Ok(value
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string))
+                })? {
+                    ModernJson::Valid(text) => text.unwrap_or_default(),
+                    ModernJson::Malformed => {
+                        diagnostics.malformed_json_lines += 1;
+                        continue;
+                    }
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                emit_v2_record(
+                    path,
+                    session_id,
+                    &links,
+                    &mut turn_id,
+                    next_doc_id,
+                    &mut emit,
+                    message_id,
+                    timestamp,
+                    kind,
+                    text,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            "assistant" => {
+                let content = match parse_modern_value(data, |value| {
+                    Ok(v2_assistant_content(value, &mut diagnostics))
+                })? {
+                    ModernJson::Valid(content) => content,
+                    ModernJson::Malformed => {
+                        diagnostics.malformed_json_lines += 1;
+                        continue;
+                    }
+                };
+                let text = content.text_parts.join("\n");
+                if text.is_empty() && !content.has_tool_fields() {
+                    continue;
+                }
+                emit_v2_record(
+                    path,
+                    session_id,
+                    &links,
+                    &mut turn_id,
+                    next_doc_id,
+                    &mut emit,
+                    message_id,
+                    timestamp,
+                    "assistant".to_string(),
+                    text,
+                    content.tool_name,
+                    content.tool_input,
+                    content.tool_output,
+                )?;
+            }
+            // Known non-content projections and any future type are skipped for forward
+            // compatibility; `synthetic` is `{"text":…}` and must not reach the assistant path.
+            "synthetic" | "idle" | "agent-switched" | "model-switched" | "compaction" | "shell" => {
+            }
+            other => diagnostics.increment_unknown_semantic(other),
+        }
+    }
+    Ok(IndexParseOutput {
+        legacy_turn_id: None,
+        offset: 0,
+        turn_id,
+        pending_tool_calls: state.pending_tool_calls,
+        session_id: Some(session_id.to_string()),
+        diagnostics,
+        session_cwd: None,
+    })
 }
 
 /// Convenience wrapper for callers that want owned records rather than a streaming callback.
@@ -2276,5 +2612,435 @@ mod tests {
 
         let scan = scan_database(&path, Some(&previous)).unwrap();
         assert_eq!(scan.dirty_session_ids, vec!["s_child", "s_root"]);
+    }
+
+    fn parse_v2_records(
+        path: &Path,
+        session_id: &str,
+        turn_id: u32,
+        next_doc_id: u64,
+    ) -> (Vec<Record>, IndexParseOutput) {
+        let mut records = Vec::new();
+        let output = parse_database_records(
+            path,
+            session_id,
+            IndexParseState {
+                turn_id,
+                ..Default::default()
+            },
+            &AtomicU64::new(next_doc_id),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        (records, output)
+    }
+
+    #[test]
+    fn v2_user_message_hydrates_text_and_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_user",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            r#"{"text":"hello world","time":{"created":100}}"#,
+        );
+        drop(connection);
+
+        let (records, output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(records.len(), 1);
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(records[0].role, "user");
+        assert_eq!(records[0].text, "hello world");
+        assert_eq!(records[0].ts, 100);
+        assert_eq!(records[0].turn_id, 0);
+        assert_eq!(records[0].links.event_id.as_deref(), Some("sm_user"));
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("fork"));
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("s_root")
+        );
+        assert_eq!(records[0].source_path, path.to_string_lossy());
+        assert_eq!(records[0].project, "opencode");
+    }
+
+    #[test]
+    fn v2_only_session_hydrates_without_a_v1_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(&connection, "s_v2only", None, "/repo/v2-only", 10, 20);
+        insert_v2_message(
+            &connection,
+            "sm_only",
+            "s_v2only",
+            "user",
+            1,
+            100,
+            100,
+            r#"{"text":"v2 only"}"#,
+        );
+        drop(connection);
+
+        let (records, _output) = parse_v2_records(&path, "s_v2only", 0, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "v2 only");
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+        assert_eq!(records[0].links.parent_session_id, None);
+    }
+
+    #[test]
+    fn v2_assistant_text_and_tool_content_hydrate_one_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        let data = serde_json::json!({
+            "agent": "build",
+            "content": [
+                {"type": "reasoning", "text": "secret"},
+                {"type": "text", "text": "running the command"},
+                {
+                    "type": "tool",
+                    "id": "call_1",
+                    "name": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "ls"},
+                        "content": [{"type": "text", "text": "file.txt"}],
+                        "metadata": {}
+                    }
+                }
+            ],
+            "time": {"created": 200}
+        })
+        .to_string();
+        insert_v2_message(
+            &connection,
+            "sm_assistant",
+            "s_child",
+            "assistant",
+            1,
+            200,
+            200,
+            &data,
+        );
+        drop(connection);
+
+        let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].role, "assistant");
+        assert_eq!(records[0].text, "running the command");
+        assert_eq!(records[0].tool_name.as_deref(), Some("bash"));
+        assert_eq!(records[0].tool_output.as_deref(), Some("file.txt"));
+        let tool_input: serde_json::Value =
+            serde_json::from_str(records[0].tool_input.as_deref().unwrap()).unwrap();
+        assert_eq!(tool_input, serde_json::json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn v2_tool_output_falls_back_to_metadata_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        let data = serde_json::json!({
+            "content": [
+                {
+                    "type": "tool",
+                    "name": "read",
+                    "state": {
+                        "input": {"path": "a.txt"},
+                        "content": [],
+                        "metadata": {"output": "file contents"}
+                    }
+                }
+            ]
+        })
+        .to_string();
+        insert_v2_message(
+            &connection,
+            "sm_fallback",
+            "s_child",
+            "assistant",
+            1,
+            200,
+            200,
+            &data,
+        );
+        drop(connection);
+
+        let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool_name.as_deref(), Some("read"));
+        assert_eq!(records[0].tool_output.as_deref(), Some("file contents"));
+    }
+
+    #[test]
+    fn v2_tool_only_assistant_message_is_emitted_with_last_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        let data = serde_json::json!({
+            "content": [
+                {
+                    "type": "tool",
+                    "name": "first",
+                    "state": {"input": {"a": 1}, "metadata": {"output": "one"}}
+                },
+                {
+                    "type": "tool",
+                    "name": "second",
+                    "state": {"input": {"b": 2}, "metadata": {"output": "two"}}
+                }
+            ]
+        })
+        .to_string();
+        insert_v2_message(
+            &connection,
+            "sm_tool_only",
+            "s_child",
+            "assistant",
+            1,
+            200,
+            200,
+            &data,
+        );
+        drop(connection);
+
+        let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "");
+        assert_eq!(records[0].tool_name.as_deref(), Some("second"));
+        assert_eq!(records[0].tool_output.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn v2_reasoning_only_assistant_message_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        let data = serde_json::json!({
+            "content": [{"type": "reasoning", "text": "thinking"}]
+        })
+        .to_string();
+        insert_v2_message(
+            &connection,
+            "sm_reasoning",
+            "s_child",
+            "assistant",
+            1,
+            200,
+            200,
+            &data,
+        );
+        drop(connection);
+
+        let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn v2_known_and_unknown_types_are_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        for (seq, (id, kind, data)) in [
+            ("sm_user", "user", r#"{"text":"kept"}"#),
+            (
+                "sm_synthetic",
+                "synthetic",
+                r#"{"text":"synthetic skipped"}"#,
+            ),
+            ("sm_shell", "shell", r#"{"text":"shell skipped"}"#),
+            ("sm_unknown", "mystery", r#"{"foo":"bar"}"#),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_v2_message(
+                &connection,
+                id,
+                "s_child",
+                kind,
+                seq as i64 + 1,
+                100,
+                100,
+                data,
+            );
+        }
+        drop(connection);
+
+        let (records, output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(
+            records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["kept"]
+        );
+        assert_eq!(
+            output.diagnostics.unknown_semantic_types.get("mystery"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn v2_malformed_messages_and_items_count_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_bad_message",
+            "s_child",
+            "assistant",
+            1,
+            100,
+            100,
+            "{bad json",
+        );
+        let data = serde_json::json!({
+            "content": ["not-an-object", {"type": "text", "text": "kept"}]
+        })
+        .to_string();
+        insert_v2_message(
+            &connection,
+            "sm_bad_item",
+            "s_child",
+            "assistant",
+            2,
+            200,
+            200,
+            &data,
+        );
+        drop(connection);
+
+        let (records, output) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(output.diagnostics.malformed_json_lines, 2);
+        assert_eq!(
+            records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["kept"]
+        );
+    }
+
+    #[test]
+    fn v2_messages_emit_in_seq_order_and_increment_turn_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(
+            &connection,
+            "s_child",
+            Some("s_root"),
+            "/repo/child",
+            30,
+            40,
+        );
+        // Inserted out of order to prove the query orders by `seq`.
+        insert_v2_message(
+            &connection,
+            "sm_third",
+            "s_child",
+            "assistant",
+            3,
+            300,
+            300,
+            r#"{"content":[{"type":"text","text":"third"}]}"#,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_first",
+            "s_child",
+            "user",
+            1,
+            100,
+            100,
+            r#"{"text":"first"}"#,
+        );
+        insert_v2_message(
+            &connection,
+            "sm_second",
+            "s_child",
+            "user",
+            2,
+            200,
+            200,
+            r#"{"text":"second"}"#,
+        );
+        drop(connection);
+
+        let (records, _output) = parse_v2_records(&path, "s_child", 5, 10);
+        assert_eq!(
+            records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(
+            records.iter().map(|r| r.turn_id).collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
+        assert_eq!(
+            records.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
     }
 }
