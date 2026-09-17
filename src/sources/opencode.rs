@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
     index: 2,
-    usage: 3,
+    usage: 4,
 };
 
 /// Version for the SQLite event cursor and owned-session reconciliation rules.  This is
@@ -30,7 +30,8 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// v3 also replaces the v1 event-rowid cursor with per-session
 /// `(max_seq, max_time_updated)` cursors for v2 databases, so persisted v1
 /// cursors must be re-derived once.
-pub const DATABASE_STATE_VERSION: u32 = 3;
+/// v4 removes legacy resurrection, splits tool records, and strengthens change detection.
+pub const DATABASE_STATE_VERSION: u32 = 4;
 
 pub fn matches_path(path: &str) -> bool {
     (path.contains("opencode/storage/message") || path.contains("opencode\\storage\\message"))
@@ -249,30 +250,27 @@ fn table_exists(connection: &Connection, path: &Path, table: &str) -> Result<boo
         .with_context(|| format!("inspect OpenCode table `{table}` in {}", path.display()))
 }
 
-/// Detect the OpenCode v2 schema by table presence alone.
-///
-/// Column inspection is deliberately omitted: planning only needs to know whether the v2
-/// session/message projection exists, and hydration performs its own validation later.  This
-/// intentionally checks no v1 table, so v2-only databases are recognized.
+/// Message storage determines the generation independently of the session table's name.
 fn has_v2_schema(connection: &Connection, path: &Path) -> Result<bool> {
-    for table in ["session_v2", "session_message"] {
-        if !table_exists(connection, path, table)? {
-            return Ok(false);
-        }
+    table_exists(connection, path, "session_message")
+}
+
+fn v2_session_table(connection: &Connection, path: &Path) -> Result<&'static str> {
+    if table_exists(connection, path, "session_v2")? {
+        Ok("session_v2")
+    } else {
+        Ok("session")
     }
-    Ok(true)
 }
 
 /// Enumerate the modern session inventory from one OpenCode database.
 ///
-/// v2 databases union the authoritative `session_v2` rows over the v1 `session` table (v2 rows
-/// win on id conflicts), matching `scan_database`.  v1-only databases take the same path as
-/// before and produce byte-identical output.
+/// Databases with a v2 projection use its metadata inventory exclusively. Without an explicit
+/// unmigrated marker, a frozen legacy row cannot be distinguished from a deleted v2 session.
 pub fn enumerate_sessions(path: &Path) -> Result<Vec<OpencodeSession>> {
     let connection = open_read_only_database(path)?;
     if has_v2_schema(&connection, path)? {
-        // v2-only databases have no v1 `session` table; the union tolerates its absence.
-        Ok(unioned_sessions_from_connection(&connection, path)?.0)
+        Ok(v2_sessions_from_connection(&connection, path)?.0)
     } else {
         require_modern_schema(&connection, path)?;
         enumerate_sessions_from_connection(&connection, path)
@@ -335,37 +333,25 @@ fn enumerate_v2_sessions_from_connection(
     connection: &Connection,
     path: &Path,
 ) -> Result<Vec<OpencodeSession>> {
+    let table = v2_session_table(connection, path)?;
     query_sessions(
         connection,
         path,
-        "SELECT id, parent_id, directory, time_created, time_updated
-         FROM session_v2 ORDER BY id",
+        &format!(
+            "SELECT id, parent_id, directory, time_created, time_updated
+         FROM {table} ORDER BY id"
+        ),
     )
 }
 
-/// Union the v1 `session` inventory with `session_v2`, preferring the v2 row whenever a session
-/// id appears in both, sorted by id.  Also returns the set of v2 session ids so callers can drive
-/// per-session dispatch without re-probing the schema.
-fn unioned_sessions_from_connection(
+/// The projection is the database's ownership boundary. Do not infer incomplete migration
+/// from missing rows: neither known layout provides durable per-session migration tombstones.
+fn v2_sessions_from_connection(
     connection: &Connection,
     path: &Path,
 ) -> Result<(Vec<OpencodeSession>, HashSet<String>)> {
-    // v2-only databases omit the v1 `session` table entirely; treat it as an empty inventory.
-    let mut by_id = if table_exists(connection, path, "session")? {
-        enumerate_sessions_from_connection(connection, path)?
-            .into_iter()
-            .map(|session| (session.id.clone(), session))
-            .collect::<HashMap<_, _>>()
-    } else {
-        HashMap::new()
-    };
-    let mut v2_ids = HashSet::new();
-    for session in enumerate_v2_sessions_from_connection(connection, path)? {
-        v2_ids.insert(session.id.clone());
-        by_id.insert(session.id.clone(), session);
-    }
-    let mut sessions = by_id.into_values().collect::<Vec<_>>();
-    sessions.sort_by(|left, right| left.id.cmp(&right.id));
+    let sessions = enumerate_v2_sessions_from_connection(connection, path)?;
+    let v2_ids = sessions.iter().map(|session| session.id.clone()).collect();
     Ok((sessions, v2_ids))
 }
 
@@ -381,6 +367,7 @@ pub struct DatabaseCursor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseScan {
+    pub v2: bool,
     pub sessions: Vec<OpencodeSession>,
     pub dirty_session_ids: Vec<String>,
     pub removed_session_ids: Vec<String>,
@@ -461,15 +448,15 @@ fn current_event_cursor(connection: &Connection, path: &Path) -> Result<Database
 
 /// Read the per-session high-water marks from the v2 `session_message` projection.
 ///
-/// `seq` is sparse and can be reused after a tail deletion, so both the maximum sequence and
-/// the maximum `time_updated` are remembered; comparing only one would miss row replacement.
+/// Prefer the durable event sequence where available. Projection maxima and row count
+/// also detect changes in older schemas, but cannot detect every same-count replacement.
 fn current_session_cursors(
     connection: &Connection,
     path: &Path,
 ) -> Result<HashMap<String, OpencodeSessionCursor>> {
     let mut statement = connection
         .prepare(
-            "SELECT session_id, MAX(seq), MAX(time_updated)
+            "SELECT session_id, MAX(seq), MAX(time_updated), COUNT(*)
              FROM session_message GROUP BY session_id",
         )
         .with_context(|| {
@@ -484,12 +471,13 @@ fn current_session_cursors(
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })
         .with_context(|| format!("query OpenCode v2 session cursors in {}", path.display()))?;
     let mut cursors = HashMap::new();
     for row in rows {
-        let (session_id, max_seq, max_time_updated) = row?;
+        let (session_id, max_seq, max_time_updated, row_count) = row?;
         cursors.insert(
             session_id.clone(),
             OpencodeSessionCursor {
@@ -498,8 +486,26 @@ fn current_session_cursors(
                 max_time_updated: nonnegative_cursor(max_time_updated).with_context(|| {
                     format!("session `{session_id}` has invalid max time_updated")
                 })?,
+                row_count,
+                event_sequence: None,
             },
         );
+    }
+    if table_exists(connection, path, "event_sequence")? {
+        let mut statement = connection
+            .prepare("SELECT aggregate_id, seq FROM event_sequence")
+            .with_context(|| format!("prepare OpenCode event sequences in {}", path.display()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .with_context(|| format!("query OpenCode event sequences in {}", path.display()))?;
+        for row in rows {
+            let (session_id, sequence) = row?;
+            let sequence = nonnegative_cursor(sequence)
+                .with_context(|| format!("session `{session_id}` has invalid event sequence"))?;
+            cursors.entry(session_id).or_default().event_sequence = Some(sequence);
+        }
     }
     Ok(cursors)
 }
@@ -555,10 +561,7 @@ pub fn scan_database(
         require_event_schema(&connection, path)?;
     }
     let (sessions, session_cursors, v2_session_ids) = if v2 {
-        // Union the v2 inventory with the v1 table, preferring the v2 row whenever a session id
-        // appears in both.  v2-only sessions must not be dropped, and shared sessions must carry
-        // the authoritative v2 metadata.
-        let (sessions, v2_ids) = unioned_sessions_from_connection(&connection, path)?;
+        let (sessions, v2_ids) = v2_sessions_from_connection(&connection, path)?;
         (
             sessions,
             current_session_cursors(&connection, path)?,
@@ -571,7 +574,14 @@ pub fn scan_database(
             HashSet::new(),
         )
     };
-    let cursor = current_event_cursor(&connection, path)?;
+    let cursor = if v2 {
+        DatabaseCursor {
+            event_rowid: 0,
+            event_id: None,
+        }
+    } else {
+        current_event_cursor(&connection, path)?
+    };
     let (mut dirty, removed) = full_reconcile(&sessions, previous);
 
     if v2 {
@@ -658,6 +668,7 @@ pub fn scan_database(
     }
 
     let scan = DatabaseScan {
+        v2,
         sessions,
         dirty_session_ids: dirty,
         removed_session_ids: removed,
@@ -917,10 +928,8 @@ pub(crate) fn parse_database_records(
     emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let connection = open_database_for_sessions(path)?;
-    // Production hydration dispatches from `DatabaseScan::v2_session_ids` in execution.rs.  This
-    // probe is equivalent (a session is v2 exactly when it has a `session_v2` row) and keeps the
-    // owned-record convenience wrappers working for tests.
-    if has_v2_schema(&connection, path)? && v2_session_exists(&connection, path, session_id)? {
+    // Never fall back to frozen rows when a projected session has been deleted.
+    if has_v2_schema(&connection, path)? {
         return parse_session_records_v2(&connection, path, session_id, state, next_doc_id, emit);
     }
     parse_session_records(&connection, path, session_id, state, next_doc_id, emit)
@@ -968,7 +977,7 @@ pub(crate) fn parse_session_records(
     };
 
     let mut diagnostics = ParseDiagnostics::default();
-    let messages = collect_modern_messages(connection, path, session_id, None, &mut diagnostics)?;
+    let messages = collect_modern_messages(connection, path, session_id, &mut diagnostics)?;
     let mut turn_id = state.turn_id;
     for message in messages {
         emit_modern_message(
@@ -995,14 +1004,11 @@ pub(crate) fn parse_session_records(
 /// Read and group v1 `message`+`part` rows for one session into per-message projections in
 /// `time_created, id, part id` order.
 ///
-/// `excluded_ids` lets the v2 union skip ids already projected from `session_message`, where the
-/// v2 row wins on conflict.  Malformed message/part JSON is counted in `diagnostics` and skipped,
-/// never an error.
+/// Malformed message/part JSON is counted in `diagnostics` and skipped, never an error.
 fn collect_modern_messages(
     connection: &Connection,
     path: &Path,
     session_id: &str,
-    excluded_ids: Option<&HashSet<String>>,
     diagnostics: &mut ParseDiagnostics,
 ) -> Result<Vec<ModernMessage>> {
     let mut statement = connection
@@ -1031,9 +1037,6 @@ fn collect_modern_messages(
     let mut malformed_message_ids = HashSet::new();
     for row in rows {
         let (message_id, timestamp, message_data, _part_id, part_data) = row?;
-        if excluded_ids.is_some_and(|ids| ids.contains(&message_id)) {
-            continue;
-        }
         if current
             .as_ref()
             .is_some_and(|message| message.id != message_id)
@@ -1177,21 +1180,21 @@ fn emit_modern_message(
 #[derive(Default)]
 struct V2AssistantContent {
     text_parts: Vec<String>,
+    tools: Vec<V2ToolContent>,
+}
+
+struct V2ToolContent {
+    identity: String,
     tool_name: Option<String>,
     tool_input: Option<String>,
     tool_output: Option<String>,
 }
 
-impl V2AssistantContent {
-    fn has_tool_fields(&self) -> bool {
-        self.tool_name.is_some() || self.tool_input.is_some() || self.tool_output.is_some()
-    }
-}
-
 fn v2_session_exists(connection: &Connection, path: &Path, session_id: &str) -> Result<bool> {
+    let table = v2_session_table(connection, path)?;
     connection
         .query_row(
-            "SELECT 1 FROM session_v2 WHERE id = ?1",
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
             [session_id],
             |_| Ok(()),
         )
@@ -1210,9 +1213,10 @@ fn v2_session_parent_id(
     path: &Path,
     session_id: &str,
 ) -> Result<Option<String>> {
+    let table = v2_session_table(connection, path)?;
     let v2_parent = connection
         .query_row(
-            "SELECT parent_id FROM session_v2 WHERE id = ?1",
+            &format!("SELECT parent_id FROM {table} WHERE id = ?1"),
             [session_id],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -1223,15 +1227,7 @@ fn v2_session_parent_id(
                 path.display()
             )
         })?;
-    match v2_parent {
-        Some(parent_id) => Ok(parent_id),
-        // v2-only databases omit the v1 `session` table; there is no fallback linkage to read.
-        None if !table_exists(connection, path, "session")? => Ok(None),
-        None => Ok(
-            enumerate_session_from_connection(connection, path, session_id)?
-                .and_then(|session| session.parent_id),
-        ),
-    }
+    Ok(v2_parent.flatten())
 }
 
 /// Parent-linkage links mirroring the v1 `parse_session_records` rule.
@@ -1319,7 +1315,7 @@ fn v2_assistant_content(
     let Some(items) = value.get("content").and_then(|content| content.as_array()) else {
         return content;
     };
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         if item.as_object().is_none() {
             diagnostics.malformed_json_lines += 1;
             continue;
@@ -1336,10 +1332,19 @@ fn v2_assistant_content(
             }
             Some("tool") => {
                 let (name, input, output) = v2_tool_fields(item);
-                // One record per assistant message, so the last tool item wins.
-                content.tool_name = name;
-                content.tool_input = input;
-                content.tool_output = output;
+                if name.is_some() || input.is_some() || output.is_some() {
+                    // Upstream tool IDs survive content updates and reordering. Older or
+                    // malformed data without an ID gets a deterministic positional fallback.
+                    let identity = v2_string_field(item, "id")
+                        .map(|id| format!("id:{id}"))
+                        .unwrap_or_else(|| format!("index:{index}"));
+                    content.tools.push(V2ToolContent {
+                        identity,
+                        tool_name: name,
+                        tool_input: input,
+                        tool_output: output,
+                    });
+                }
             }
             Some("reasoning") | Some("file") => {}
             Some(_) | None => {}
@@ -1413,8 +1418,8 @@ fn v2_emitted_timestamp(timestamp: i64, diagnostics: &mut ParseDiagnostics) -> O
 ///
 /// v2 is event-sourced: every message kind shares one table, assistant content lives in a
 /// `content[]` array, and tool-only turns carry no text.  This deliberately does not reuse
-/// `emit_modern_message`, whose empty-text guard would drop those turns.  Dual-store sessions
-/// additionally union any v1 `message` rows absent from `session_message`.
+/// `emit_modern_message`, whose empty-text guard would drop those turns. Legacy rows are not
+/// merged into an authoritative v2 projection, including after a revert.
 pub(crate) fn parse_session_records_v2(
     connection: &Connection,
     path: &Path,
@@ -1423,6 +1428,17 @@ pub(crate) fn parse_session_records_v2(
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    if !v2_session_exists(connection, path, session_id)? {
+        return Ok(IndexParseOutput {
+            legacy_turn_id: None,
+            offset: 0,
+            turn_id: state.turn_id,
+            pending_tool_calls: state.pending_tool_calls,
+            session_id: Some(session_id.to_string()),
+            diagnostics: Default::default(),
+            session_cwd: None,
+        });
+    }
     let parent_id = v2_session_parent_id(connection, path, session_id)?;
     let links = v2_session_links(parent_id);
 
@@ -1445,11 +1461,9 @@ pub(crate) fn parse_session_records_v2(
         .with_context(|| format!("query OpenCode v2 messages in {}", path.display()))?;
 
     let mut diagnostics = ParseDiagnostics::default();
-    let mut v2_ids = HashSet::new();
     let mut pending: Vec<V2PendingRecord> = Vec::new();
     for row in rows {
         let (message_id, kind, _seq, timestamp, data) = row?;
-        v2_ids.insert(message_id.clone());
         match kind.as_str() {
             "user" | "system" => {
                 // Timestamps are validated only for emitted kinds, so a bad value on a skippable
@@ -1497,18 +1511,28 @@ pub(crate) fn parse_session_records_v2(
                     }
                 };
                 let text = content.text_parts.join("\n");
-                if text.is_empty() && !content.has_tool_fields() {
-                    continue;
+                if !text.is_empty() {
+                    pending.push(V2PendingRecord {
+                        event_id: message_id.clone(),
+                        ts: timestamp,
+                        role: "assistant".to_string(),
+                        text,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                    });
                 }
-                pending.push(V2PendingRecord {
-                    event_id: message_id,
-                    ts: timestamp,
-                    role: "assistant".to_string(),
-                    text,
-                    tool_name: content.tool_name,
-                    tool_input: content.tool_input,
-                    tool_output: content.tool_output,
-                });
+                for tool in content.tools {
+                    pending.push(V2PendingRecord {
+                        event_id: format!("{message_id}:tool:{}", tool.identity),
+                        ts: timestamp,
+                        role: "assistant".to_string(),
+                        text: String::new(),
+                        tool_name: tool.tool_name,
+                        tool_input: tool.tool_input,
+                        tool_output: tool.tool_output,
+                    });
+                }
             }
             // Known non-content projections and any future type are skipped for forward
             // compatibility; `synthetic` is `{"text":…}` and must not reach the assistant path.
@@ -1518,45 +1542,9 @@ pub(crate) fn parse_session_records_v2(
         }
     }
 
-    // Dual-store union: append v1 `message` rows with no `session_message` counterpart.  `msg_*`
-    // ids are globally unique, so excluding the v2 ids is sufficient deduplication; v2 wins on
-    // conflict.  The exclusion is intentionally id-based, not kind-based: when a v2 row is a
-    // skipped kind (e.g. `synthetic`), its v1 counterpart is excluded too, so content-parity loss
-    // versus pre-v2 indexing is accepted policy (Phase C type policy stays uniform).  v2-only
-    // databases have no v1 `message`/`part` tables, so the union is skipped entirely.
-    let v1_message_tables =
-        table_exists(connection, path, "message")? && table_exists(connection, path, "part")?;
-    for message in if v1_message_tables {
-        collect_modern_messages(
-            connection,
-            path,
-            session_id,
-            Some(&v2_ids),
-            &mut diagnostics,
-        )?
-    } else {
-        Vec::new()
-    } {
-        let text = message.text_parts.join("\n");
-        // v1-only rows carry no tool fields, so `emit_modern_message` would have dropped an empty
-        // projection; mirror that here instead of emitting a blank record.
-        if text.is_empty() {
-            continue;
-        }
-        pending.push(V2PendingRecord {
-            event_id: message.id,
-            ts: message.timestamp,
-            role: message.role,
-            text,
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-        });
-    }
-
-    // The sort is stable, so equal-timestamp v2 rows keep their `seq` order and the turn_id
-    // sequence stays deterministic.  v1-only rows are appended after all v2 rows, so v2 wins
-    // equal-`ts` ties (arbitrary but stable).
+    // A v2 projection owns the entire session. Missing rows may have been reverted or
+    // deleted; never resurrect them from the frozen legacy message/part tables.
+    // Stable sorting preserves projection order for equal timestamps.
     pending.sort_by_key(|record| record.ts);
     let mut turn_id = state.turn_id;
     for record in pending {
@@ -1616,6 +1604,7 @@ pub fn parse_database_session(
 pub fn usage_files() -> Vec<PathBuf> {
     let roots = data_roots();
     let mut files = Vec::new();
+    let mut projected_roots = HashSet::new();
     for root in &roots {
         let mut databases = std::fs::read_dir(root)
             .into_iter()
@@ -1631,9 +1620,31 @@ pub fn usage_files() -> Vec<PathBuf> {
             })
             .collect::<Vec<_>>();
         databases.sort();
+        if databases.iter().any(|path| {
+            // A readable projection owns this data root, including IDs deleted before this
+            // scan. Unreadable databases retain the existing legacy-file fallback behavior.
+            (|| -> Result<bool> {
+                let connection = open_read_only_database(path)?;
+                if !has_v2_schema(&connection, path)? {
+                    return Ok(false);
+                }
+                let table = v2_session_table(&connection, path)?;
+                connection.prepare(&format!(
+                    "SELECT m.id, m.session_id, m.type, m.data FROM session_message AS m
+                     JOIN {table} AS s ON s.id = m.session_id LIMIT 0"
+                ))?;
+                Ok(true)
+            })()
+            .unwrap_or(false)
+        }) {
+            projected_roots.insert(root);
+        }
         files.extend(databases);
     }
     for root in &roots {
+        if projected_roots.contains(root) {
+            continue;
+        }
         let message_root = root.join("storage/message");
         if message_root.exists() {
             files.extend(
@@ -1681,22 +1692,13 @@ fn parse_usage_database(path: &Path) -> Result<Vec<UsageEvent>> {
     if has_v2_schema(&connection, path)? {
         // v2 assistant rows carry the usage projection.  v2 `data` has no top-level
         // `sessionID`, so the selected `session_id` column is passed as the fallback.
-        let mut statement = connection
-            .prepare("SELECT id, session_id, data FROM session_message WHERE type = 'assistant'")?;
+        let table = v2_session_table(&connection, path)?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT m.id, m.session_id, m.data FROM session_message AS m
+             JOIN {table} AS s ON s.id = m.session_id WHERE m.type = 'assistant'"
+        ))?;
         let rows = statement.query_map([], usage_row)?;
         collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
-
-        // Keep v1 rows that have no v2 counterpart so v1-only sessions (and dual-store rows the
-        // v2 projection is missing) still contribute; ids already seen above are skipped.
-        // v2-only databases have no v1 `message` table, so the union contributes nothing.
-        if table_exists(&connection, path, "message")? {
-            let mut statement = connection.prepare(
-                "SELECT id, session_id, data FROM message
-                 WHERE id NOT IN (SELECT id FROM session_message)",
-            )?;
-            let rows = statement.query_map([], usage_row)?;
-            collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
-        }
     } else {
         let mut statement = connection.prepare("SELECT id, session_id, data FROM message")?;
         let rows = statement.query_map([], usage_row)?;
@@ -1975,6 +1977,12 @@ mod tests {
         time_updated: i64,
         data: &str,
     ) {
+        // Projection rows belong to an existing v2 session, just as upstream's FK requires.
+        connection.execute(
+            "INSERT OR IGNORE INTO session_v2
+             SELECT id, parent_id, directory, time_created, time_updated FROM session WHERE id = ?1",
+            [session_id],
+        ).unwrap();
         connection
             .execute(
                 "INSERT INTO session_message
@@ -1997,6 +2005,72 @@ mod tests {
 
     const V2_USER_DATA: &str = r#"{"text":"hello","time":{"created":100}}"#;
     const V2_ASSISTANT_DATA: &str = r#"{"agent":"build","model":{"providerID":"anthropic","id":"claude"},"content":[{"type":"text","text":"hi"}],"tokens":{"input":1,"output":2},"cost":0.0,"time":{"created":200}}"#;
+
+    #[test]
+    fn pinned_upstream_schema_plans_hydrates_and_counts_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/opencode/upstream-5a833585.sql"
+            ))
+            .unwrap();
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                 VALUES ('project', '/repo', 1, 1, '[]');
+             INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+                 VALUES ('current', 'project', 'parent', 'slug', '/repo', 'test', '2', 1, 200);
+             INSERT INTO event_sequence (aggregate_id, seq) VALUES ('current', 5);"
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO session_message VALUES ('answer', 'current', 'assistant', 2, 200, 200, ?1)",
+            [V2_ASSISTANT_DATA],
+        ).unwrap();
+        // The pinned schema still has legacy tables. Their rows must not override v2 ownership.
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('answer', 'current', 200, 200, ?1)",
+                [V2_ASSISTANT_DATA],
+            )
+            .unwrap();
+        let scan = scan_database(&path, None).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["current"]);
+        assert!(scan.v2_session_ids.contains("current"));
+        assert_eq!(scan.session_cursors["current"].event_sequence, Some(5));
+        assert_eq!(enumerate_sessions(&path).unwrap()[0].directory, "/repo");
+        let records = parse_database_session(&path, "current", 0, &AtomicU64::new(1)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "hi");
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("parent")
+        );
+        let usage = parse_usage_database(&path).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].tokens.uncached_input, 1);
+        assert_eq!(usage[0].model.as_deref(), Some("claude"));
+
+        connection
+            .execute("DELETE FROM session_message", [])
+            .unwrap();
+        let after = scan_database(&path, Some(&state_from_scan(&scan))).unwrap();
+        assert_eq!(after.dirty_session_ids, vec!["current"]);
+        assert!(
+            parse_database_session(&path, "current", 0, &AtomicU64::new(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_usage_database(&path).unwrap().is_empty());
+        connection.execute("DELETE FROM session", []).unwrap();
+        assert_eq!(
+            scan_database(&path, Some(&state_from_scan(&scan)))
+                .unwrap()
+                .removed_session_ids,
+            vec!["current"]
+        );
+    }
 
     #[test]
     fn reasoning_is_included_in_output_and_total() {
@@ -2530,6 +2604,8 @@ mod tests {
             OpencodeSessionCursor {
                 max_seq: 2,
                 max_time_updated: 200,
+                row_count: 2,
+                event_sequence: None,
             }
         );
         let previous = state_from_scan(&initial);
@@ -2591,12 +2667,14 @@ mod tests {
             OpencodeSessionCursor {
                 max_seq: 1,
                 max_time_updated: 100,
+                row_count: 1,
+                event_sequence: None,
             }
         );
     }
 
     #[test]
-    fn v1_only_session_without_v2_messages_stays_clean() {
+    fn frozen_legacy_sessions_are_not_in_the_v2_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -2604,14 +2682,162 @@ mod tests {
 
         let initial = scan_database(&path, None).unwrap();
         assert!(initial.session_cursors.is_empty());
-        assert_eq!(initial.dirty_session_ids, vec!["s_child", "s_root"]);
+        assert!(initial.dirty_session_ids.is_empty());
         let previous = state_from_scan(&initial);
 
-        // No `session_message` rows means no current cursor, so a steady-state v1-only
-        // session must never be re-hydrated.
+        // Legacy rows may be deleted migrated sessions, including before the first scan.
         let scan = scan_database(&path, Some(&previous)).unwrap();
         assert!(scan.dirty_session_ids.is_empty());
         assert!(scan.removed_session_ids.is_empty());
+    }
+
+    #[test]
+    fn v2_deleted_middle_row_marks_session_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        for (id, seq, timestamp) in [("first", 1, 100), ("middle", 2, 200), ("last", 3, 300)] {
+            insert_v2_message(
+                &connection,
+                id,
+                "s_child",
+                "user",
+                seq,
+                timestamp,
+                timestamp,
+                V2_USER_DATA,
+            );
+        }
+        drop(connection);
+
+        let initial = scan_database(&path, None).unwrap();
+        let previous = state_from_scan(&initial);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("DELETE FROM session_message WHERE id = 'middle'", [])
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+        assert_eq!(
+            scan.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                max_seq: 3,
+                max_time_updated: 300,
+                row_count: 2,
+                event_sequence: None,
+            }
+        );
+        assert_eq!(initial.session_cursors["s_child"].row_count, 3);
+        let records = parse_database_session(&path, "s_child", 0, &AtomicU64::new(0)).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn v2_event_sequence_detects_same_count_middle_replacement() {
+        for with_event_sequence in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = v2_fixture(&path);
+            for (id, seq, timestamp) in [("first", 1, 100), ("middle", 2, 200), ("last", 3, 300)] {
+                insert_v2_message(
+                    &connection,
+                    id,
+                    "s_child",
+                    "user",
+                    seq,
+                    timestamp,
+                    timestamp,
+                    V2_USER_DATA,
+                );
+            }
+            if with_event_sequence {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+                         INSERT INTO event_sequence VALUES ('s_child', 3);",
+                    )
+                    .unwrap();
+            }
+            let initial = scan_database(&path, None).unwrap();
+            let previous = state_from_scan(&initial);
+            connection
+                .execute(
+                    "UPDATE session_message SET id = 'replacement' WHERE id = 'middle'",
+                    [],
+                )
+                .unwrap();
+            if with_event_sequence {
+                connection
+                    .execute(
+                        "UPDATE event_sequence SET seq = 4 WHERE aggregate_id = 's_child'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+
+            let scan = scan_database(&path, Some(&previous)).unwrap();
+            let cursor = &scan.session_cursors["s_child"];
+            assert_eq!(cursor.max_seq, 3);
+            assert_eq!(cursor.max_time_updated, 300);
+            assert_eq!(cursor.row_count, 3);
+            if with_event_sequence {
+                assert_eq!(cursor.event_sequence, Some(4));
+                assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
+            } else {
+                // Older schemas retain the documented projection-only limitation.
+                assert_eq!(cursor.event_sequence, None);
+                assert!(scan.dirty_session_ids.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn v2_empty_projection_retains_event_sequence_and_detects_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(&connection, "s_child", None, "/repo", 1, 1);
+        connection
+            .execute_batch(
+                "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+                 INSERT INTO event_sequence VALUES ('s_child', 7);",
+            )
+            .unwrap();
+        let initial = scan_database(&path, None).unwrap();
+        assert_eq!(
+            initial.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                event_sequence: Some(7),
+                ..Default::default()
+            }
+        );
+        let previous = state_from_scan(&initial);
+        assert!(
+            scan_database(&path, Some(&previous))
+                .unwrap()
+                .dirty_session_ids
+                .is_empty()
+        );
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 's_child'",
+                [],
+            )
+            .unwrap();
+        let truncated = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(truncated.dirty_session_ids, vec!["s_child"]);
+        assert_eq!(truncated.session_cursors["s_child"].event_sequence, Some(0));
+        let previous = state_from_scan(&truncated);
+        connection
+            .execute("DELETE FROM event_sequence", [])
+            .unwrap();
+        drop(connection);
+        let empty = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(empty.dirty_session_ids, vec!["s_child"]);
+        assert!(!empty.session_cursors.contains_key("s_child"));
     }
 
     #[test]
@@ -2619,6 +2845,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
+        insert_v2_session(&connection, "s_child", None, "/repo", 1, 1);
         drop(connection);
 
         let initial = scan_database(&path, None).unwrap();
@@ -2667,6 +2894,8 @@ mod tests {
             OpencodeSessionCursor {
                 max_seq: 1,
                 max_time_updated: 100,
+                row_count: 1,
+                event_sequence: None,
             }
         );
         let previous = state_from_scan(&initial);
@@ -2724,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_inventory_union_prefers_v2_and_reports_removals() {
+    fn v2_inventory_reports_shared_session_removals() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -2745,7 +2974,7 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["s_child", "s_root", "s_v2only"]
+            vec!["s_child", "s_v2only"]
         );
         assert_eq!(
             scan.v2_session_ids,
@@ -2762,14 +2991,18 @@ mod tests {
         let previous = state_from_scan(&scan);
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute("DELETE FROM session_v2 WHERE id = 's_v2only'", [])
+            .execute("DELETE FROM session_v2 WHERE id = 's_child'", [])
             .unwrap();
         drop(connection);
 
         let after = scan_database(&path, Some(&previous)).unwrap();
         assert!(after.dirty_session_ids.is_empty());
-        assert_eq!(after.removed_session_ids, vec!["s_v2only"]);
-        assert_eq!(after.v2_session_ids, HashSet::from(["s_child".to_string()]));
+        assert_eq!(after.removed_session_ids, vec!["s_child"]);
+        assert_eq!(
+            after.v2_session_ids,
+            HashSet::from(["s_v2only".to_string()])
+        );
+        assert_eq!(enumerate_sessions(&path).unwrap().len(), 1);
     }
 
     #[test]
@@ -2796,7 +3029,7 @@ mod tests {
         previous.owned_session_ids.insert("s_gone".to_string());
 
         let scan = scan_database(&path, Some(&previous)).unwrap();
-        assert_eq!(scan.dirty_session_ids, vec!["s_child", "s_root"]);
+        assert_eq!(scan.dirty_session_ids, vec!["s_child"]);
         assert_eq!(scan.removed_session_ids, vec!["s_gone"]);
     }
 
@@ -2935,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_assistant_text_and_tool_content_hydrate_one_record() {
+    fn v2_assistant_prose_and_tool_hydrate_separate_records() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -2980,13 +3213,20 @@ mod tests {
         drop(connection);
 
         let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert_eq!(records[0].role, "assistant");
         assert_eq!(records[0].text, "running the command");
-        assert_eq!(records[0].tool_name.as_deref(), Some("bash"));
-        assert_eq!(records[0].tool_output.as_deref(), Some("file.txt"));
+        assert_eq!(records[0].links.event_id.as_deref(), Some("sm_assistant"));
+        assert!(records[0].tool_name.is_none());
+        assert!(records[1].text.is_empty());
+        assert_eq!(
+            records[1].links.event_id.as_deref(),
+            Some("sm_assistant:tool:id:call_1")
+        );
+        assert_eq!(records[1].tool_name.as_deref(), Some("bash"));
+        assert_eq!(records[1].tool_output.as_deref(), Some("file.txt"));
         let tool_input: serde_json::Value =
-            serde_json::from_str(records[0].tool_input.as_deref().unwrap()).unwrap();
+            serde_json::from_str(records[1].tool_input.as_deref().unwrap()).unwrap();
         assert_eq!(tool_input, serde_json::json!({"command": "ls"}));
     }
 
@@ -3036,7 +3276,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_tool_only_assistant_message_is_emitted_with_last_tool() {
+    fn v2_tool_only_assistant_message_preserves_every_tool_and_counts_usage_once() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -3049,9 +3289,11 @@ mod tests {
             40,
         );
         let data = serde_json::json!({
+            "tokens": {"input": 7, "output": 11},
             "content": [
                 {
                     "type": "tool",
+                    "id": "call_first",
                     "name": "first",
                     "state": {"input": {"a": 1}, "metadata": {"output": "one"}}
                 },
@@ -3076,10 +3318,51 @@ mod tests {
         drop(connection);
 
         let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert_eq!(records[0].text, "");
-        assert_eq!(records[0].tool_name.as_deref(), Some("second"));
-        assert_eq!(records[0].tool_output.as_deref(), Some("two"));
+        assert_eq!(records[0].tool_name.as_deref(), Some("first"));
+        assert_eq!(records[0].tool_output.as_deref(), Some("one"));
+        assert_eq!(records[0].tool_input.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(
+            records[0].links.event_id.as_deref(),
+            Some("sm_tool_only:tool:id:call_first")
+        );
+        assert_eq!(records[1].tool_name.as_deref(), Some("second"));
+        assert_eq!(records[1].tool_output.as_deref(), Some("two"));
+        assert_eq!(records[1].tool_input.as_deref(), Some("{\"b\":2}"));
+        assert_eq!(
+            records[1].links.event_id.as_deref(),
+            Some("sm_tool_only:tool:index:1")
+        );
+
+        let (reparsed, _) = parse_v2_records(&path, "s_child", 10, 100);
+        for (original, repeated) in records.iter().zip(&reparsed) {
+            assert_eq!(original.links.event_id, repeated.links.event_id);
+        }
+        let usage = parse_usage_file(&path).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].message_id.as_deref(), Some("sm_tool_only"));
+        assert_eq!(usage[0].tokens.uncached_input, 7);
+        assert_eq!(usage[0].tokens.output, 11);
+
+        // Inserting prose before a tool must not change an upstream-ID-based identity.
+        let mut updated: serde_json::Value = serde_json::from_str(&data).unwrap();
+        updated["content"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"type": "text", "text": "new explanation"}),
+        );
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE session_message SET data = ?1 WHERE id = 'sm_tool_only'",
+                [updated.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        let (updated_records, _) = parse_v2_records(&path, "s_child", 0, 1);
+        assert_eq!(updated_records.len(), 3);
+        assert_eq!(updated_records[0].text, "new explanation");
+        assert_eq!(updated_records[1].links.event_id, records[0].links.event_id);
     }
 
     #[test]
@@ -3297,7 +3580,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_dual_store_unions_v1_only_messages() {
+    fn v2_dual_store_never_hydrates_missing_projection_rows() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -3319,9 +3602,7 @@ mod tests {
             100,
             r#"{"text":"from v2"}"#,
         );
-        // A v1 row sharing the v2 id must be dropped in favor of the v2 projection, while a
-        // v1-only row must survive the union.  A v1-only row with empty text must be dropped just
-        // as `emit_modern_message` would have dropped it.
+        // Missing projection rows are ambiguous: they may have been deleted before this scan.
         insert_v1_message(&connection, "sm_shared", "s_child", 100, "shadowed");
         insert_v1_message(&connection, "msg_v1only", "s_child", 50, "v1 only");
         insert_v1_message(&connection, "msg_empty", "s_child", 25, "");
@@ -3330,22 +3611,22 @@ mod tests {
         let (records, _output) = parse_v2_records(&path, "s_child", 0, 1);
         assert_eq!(
             records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
-            vec!["v1 only", "from v2"]
+            vec!["from v2"]
         );
         assert_eq!(
             records
                 .iter()
                 .map(|r| r.links.event_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec![Some("msg_v1only"), Some("sm_shared")]
+            vec![Some("sm_shared")]
         );
         assert_eq!(
             records.iter().map(|r| r.turn_id).collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![0]
         );
         assert_eq!(
             records.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![1]
         );
         assert!(!records.iter().any(|r| r.text == "shadowed"));
         assert!(
@@ -3599,7 +3880,7 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_sessions_unions_v2_inventory() {
+    fn enumerate_sessions_uses_authoritative_v2_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -3620,7 +3901,7 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["s_child", "s_root", "s_v2only"]
+            vec!["s_child", "s_v2only"]
         );
         let child = sessions
             .iter()
@@ -3700,7 +3981,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_usage_unions_v1_only_messages_and_dedupes_shared_ids() {
+    fn v2_usage_never_resurrects_missing_projection_rows() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("opencode.db");
         let connection = v2_fixture(&path);
@@ -3721,7 +4002,7 @@ mod tests {
                 [r#"{"tokens":{"input":999,"output":999}}"#],
             )
             .unwrap();
-        // A v1-only row must survive the union.
+        // A legacy-only row may have been deleted from v2 and must not be counted.
         connection
             .execute(
                 "INSERT INTO message VALUES ('msg_v1only', 's_child', 300, ?1)",
@@ -3731,21 +4012,13 @@ mod tests {
         drop(connection);
 
         let events = parse_usage_file(&path).unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         let v2_event = events
             .iter()
             .find(|event| event.source_record_id.as_deref() == Some("sm_v2"))
             .expect("v2 event");
         assert_eq!(v2_event.tokens.uncached_input, 1);
         assert_eq!(v2_event.provider.as_deref(), Some("anthropic"));
-        let v1_event = events
-            .iter()
-            .find(|event| event.source_record_id.as_deref() == Some("msg_v1only"))
-            .expect("v1-only event");
-        assert_eq!(v1_event.tokens.uncached_input, 5);
-        assert_eq!(v1_event.provider.as_deref(), Some("openai"));
-        assert_eq!(v1_event.model.as_deref(), Some("gpt"));
-        assert_eq!(v1_event.session_id.as_deref(), Some("s_child"));
     }
 
     #[test]
@@ -3792,6 +4065,8 @@ mod tests {
             OpencodeSessionCursor {
                 max_seq: 2,
                 max_time_updated: 200,
+                row_count: 2,
+                event_sequence: None,
             }
         );
         assert_eq!(scan.cursor.event_rowid, 0);

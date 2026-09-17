@@ -55,6 +55,8 @@ fn database() -> OpencodeDatabaseState {
             OpencodeSessionCursor {
                 max_seq: i64::MIN,
                 max_time_updated: i64::MAX,
+                row_count: i64::MAX,
+                event_sequence: Some(i64::MAX),
             },
         )]),
     }
